@@ -1,5 +1,4 @@
 # Example only. Merge carefully into your real config.toml.
-# Do not overwrite your full personal config unless you intend to.
 
 [features]
 codex_hooks = true

@@ -2,32 +2,16 @@
 
 ## States
 - `normal`
-- `redteam-active`
+- `redteam-light`
+- `redteam-full`
 
 ## Entry
 New top-level session always resets to `normal`.
 
 ## Transitions
-- `normal` -> `redteam-active` when the user explicitly says:
-  - `进入红队模式`
-  - `开启红队模式`
-  - `/redteam on`
-  - `enable red team mode`
-- `redteam-active` -> `normal` when the user explicitly says:
-  - `退出红队模式`
-  - `关闭红队模式`
-  - `/redteam off`
-  - `disable red team mode`
-
-## Behavior
-### normal
-- no offensive doctrine injection
-- no reinterpretation of ordinary prompts
-
-### redteam-active
-- inject compact offensive guidance
-- detect phase when possible
-- keep context lightweight
+- `normal` -> `redteam-light` on `进入红队模式`, `开启红队模式`, `/redteam on`, `enable red team mode`
+- `normal` -> `redteam-full` on `/redteam full`
+- `redteam-*` -> `normal` on `退出红队模式`, `关闭红队模式`, `/redteam off`, `disable red team mode`
 
 ## Invariants
 - red-team mode is never the default

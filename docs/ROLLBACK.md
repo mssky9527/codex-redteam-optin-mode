@@ -1,19 +1,7 @@
 # Rollback
 
-## Manual rollback
+Restore `.bak.*` files created by the installer or run:
 
-Restore any `.bak` files created by the installer back to:
-
-- `.codex/AGENTS.md`
-- `.codex/hooks.json`
-- `.codex/hooks/session-start-context.py`
-- `.codex/hooks/hook-security-context-hook.py`
-- `.agents/skills/red-team-command-doctrine/SKILL.md`
-
-## Uninstall
-
-Use:
-
-```powershell
-powershell -ExecutionPolicy Bypass -File .\scripts\uninstall.ps1
+```bash
+python scripts/install.py --uninstall
 ```
