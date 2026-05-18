@@ -1,18 +1,12 @@
 # Codex Red Team Opt-In Mode
 
-[English](./README.md)
+[English](./README.md)|[Chinese](./README_ZH.md)
 
 > 默认保持 normal，只有显式开启时才进入 red-team。
 
-这是一个面向 Codex 的**轻量、pack-first** 红队运行时 / 配置层。
+这是一个面向 Codex 的红队配置层。
 
 它的目标不是把 Codex 变成自动化攻击平台
-
-## 项目说明
-
-- 这个仓库是 **GitHub 通用版**
-- 不应包含个人本地路径、私有目标数据或用户专属工具偏好
-- 文档描述必须和当前实际运行行为一致，不能写成“计划中的样子”
 
 ## 为什么做这个项目
 
