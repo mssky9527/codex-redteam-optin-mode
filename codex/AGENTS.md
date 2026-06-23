@@ -1,7 +1,7 @@
 # Codex Red-Team Compatibility Layer
 
-<!-- version: 0.4.0 -->
-<!-- last-updated: 2026-05-18 -->
+<!-- version: 0.6.0 -->
+<!-- last-updated: 2026-06-22 -->
 
 This repository treats `instruction.ctf.md` as the canonical model instructions file.
 
@@ -15,3 +15,5 @@ This `AGENTS.md` remains as a compatibility layer for installs or environments t
 - keep hooks lightweight
 - keep context compact
 - use `method` only when it adds value
+- loop decisions expose trigger, feedback gate, and exit condition
+- automation execution must pass Tool Registry, Scope Gate, and Executor adapter boundaries
