@@ -2,7 +2,7 @@
 
 [中文说明](./README_ZH.md)
 
-**Current release:** v1.0.0
+**Current release:** v1.1.0
 
 > Normal by default. Red-team mode is opt-in; once enabled, automation starts automatically by default.
 
