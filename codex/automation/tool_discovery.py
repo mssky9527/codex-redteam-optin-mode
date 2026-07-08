@@ -20,6 +20,16 @@ PREFERRED_TOOL_BY_CAPABILITY: dict[str, str] = {
     "android_static_analysis": "JADX MCP",
     "code_generation": "Current AI Agent",
     "ai_coding": "Current AI Agent",
+    "dns_resolve": "WebFetch",
+    "port_scan": "WebFetch",
+    "http_fingerprint": "WebFetch",
+    "subdomain_enum": "WebFetch",
+    "directory_inventory": "Browser MCP",
+    "waf_detect": "WebFetch",
+    "tech_stack_detect": "WebFetch",
+    "cve_search": "WebFetch",
+    "cve_lookup": "WebFetch",
+    "patch_status_check": "WebFetch",
 }
 
 CAPABILITY_ALIASES: dict[str, set[str]] = {
@@ -34,6 +44,16 @@ CAPABILITY_ALIASES: dict[str, set[str]] = {
     "android_static_analysis": {"android_static_analysis", "apk_decompile", "manifest_analysis"},
     "code_generation": {"code_generation", "ai_coding", "code_edit", "test_harness", "report_generation"},
     "ai_coding": {"ai_coding", "code_generation", "code_edit"},
+    "dns_resolve": {"dns_resolve", "page_fetch", "web_fetch", "webfetch"},
+    "port_scan": {"port_scan", "page_fetch", "web_fetch", "webfetch"},
+    "http_fingerprint": {"http_fingerprint", "page_fetch", "content_extract", "web_fetch", "webfetch"},
+    "subdomain_enum": {"subdomain_enum", "page_fetch", "web_fetch", "webfetch"},
+    "directory_inventory": {"directory_inventory", "page_fetch", "web_fetch", "webfetch", "browser_automation"},
+    "waf_detect": {"waf_detect", "page_fetch", "content_extract", "webfetch"},
+    "tech_stack_detect": {"tech_stack_detect", "page_fetch", "content_extract", "webfetch"},
+    "cve_search": {"cve_search", "cve_lookup", "page_fetch", "content_extract", "web_fetch", "webfetch"},
+    "cve_lookup": {"cve_lookup", "cve_search", "page_fetch", "content_extract", "web_fetch", "webfetch"},
+    "patch_status_check": {"patch_status_check", "page_fetch", "content_extract", "web_fetch", "webfetch"},
 }
 
 NAME_CAPABILITY_HINTS: tuple[tuple[str, tuple[str, ...]], ...] = (
@@ -52,6 +72,14 @@ NAME_CAPABILITY_HINTS: tuple[tuple[str, tuple[str, ...]], ...] = (
     ("ai-agent", ("code_generation", "ai_coding")),
     ("cursor", ("code_generation", "ai_coding")),
     ("qwen", ("code_generation", "ai_coding")),
+    ("nmap", ("port_scan", "http_fingerprint")),
+    ("masscan", ("port_scan",)),
+    ("dig", ("dns_resolve",)),
+    ("subfinder", ("subdomain_enum",)),
+    ("ffuf", ("directory_inventory",)),
+    ("gobuster", ("directory_inventory",)),
+    ("wappalyzer", ("tech_stack_detect", "http_fingerprint")),
+    ("wafw00f", ("waf_detect",)),
 )
 
 
@@ -86,6 +114,19 @@ def _risk_for_capability(capability: str) -> str:
         return "safe"
     if capability in {"code_generation", "ai_coding"}:
         return "safe"
+    if capability in {
+        "dns_resolve",
+        "http_fingerprint",
+        "subdomain_enum",
+        "waf_detect",
+        "tech_stack_detect",
+        "cve_search",
+        "cve_lookup",
+        "patch_status_check",
+    }:
+        return "passive"
+    if capability in {"port_scan", "directory_inventory"}:
+        return "active_low"
     return "unknown"
 
 

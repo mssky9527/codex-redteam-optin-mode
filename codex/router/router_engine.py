@@ -45,7 +45,8 @@ def select_router(prompt: str, phase: str) -> str:
         return "network-protocol-attacks"
     if phase == "crypto":
         if re.search("\\b(md5|sha1|sha256|hash|length extension)\\b|\u54c8\u5e0c|\u957f\u5ea6\u6269\u5c55", p, re.I): return "hash-attack-techniques"
-        if re.search("\\b(aes|des|cbc|gcm|ctr|padding oracle)\\b|\u5bf9\u79f0\u52a0\u5bc6|\u586b\u5145\u9884\u8a00\u673a", p, re.I): return "symmetric-cipher-attacks"
+        if re.search("\\b(padding oracle)\\b|\u586b\u5145\u9884\u8a00\u673a", p, re.I): return "rsa-attack-techniques"
+        if re.search("\\b(aes|des|cbc|gcm|ctr)\\b|\u5bf9\u79f0\u52a0\u5bc6", p, re.I): return "symmetric-cipher-attacks"
         if re.search("\\b(lattice|lwe|ntru)\\b|\u683c\u5bc6\u7801", p, re.I): return "lattice-crypto-attacks"
         if re.search("\\b(stego|steganography)\\b|\u9690\u5199", p, re.I): return "steganography-techniques"
         if re.search("\\b(caesar|vigenere|classical cipher)\\b|\u53e4\u5178\u5bc6\u7801", p, re.I): return "classical-cipher-analysis"

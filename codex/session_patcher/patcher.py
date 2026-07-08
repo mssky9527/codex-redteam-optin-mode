@@ -247,7 +247,7 @@ def _extract_context_for_rewrite(lines: List[Dict[str, Any]], refusal_index: int
             pt = payload.get("type", "")
             msg = payload.get("message", "")
             if pt == "agent_message" and msg:
-                context.append(f"[User] {msg[:2000]}")
+                context.append(f"[Agent] {msg[:2000]}")
 
         if len(context) >= max_messages:
             break

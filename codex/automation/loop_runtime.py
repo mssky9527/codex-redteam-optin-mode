@@ -47,6 +47,7 @@ class LoopRuntime:
         recon_ctx: ReconContext | None = None,
     ) -> None:
         self.recorder = LoopRecorder(log_root)
+        self._executor_provided = executor is not None
         self.executor = executor or Executor(plan_only=True)
         self.tool_config_paths = tool_config_paths
         self.artifact_store = ArtifactStore(artifact_root or (log_root / "artifacts"))
@@ -56,6 +57,8 @@ class LoopRuntime:
 
     def run_once(self, state: LoopRuntimeState) -> LoopRuntimeResult:
         """Execute a single Observe-Decide-Act-Verify-Record iteration."""
+        if state.automation_mode == "active" and not self._executor_provided and self.executor.plan_only:
+            self.executor = Executor(plan_only=False)
         path = select_decision_path(state.objective, phase=state.phase, recon_ctx=self.recon_ctx)
         plan = create_automation_plan(
             objective=state.objective,
@@ -66,6 +69,7 @@ class LoopRuntime:
         tool_gate = evaluate_tool_gate(
             required_capabilities=path.required_capabilities,
             missing_capabilities=plan.missing_capabilities,
+            plan_only_allowed=state.automation_mode != "active",
         )
         execution_results: list[ExecutionResult] = []
         scope_gate_results: list[GateResult] = []
@@ -165,14 +169,92 @@ class LoopRuntime:
         )
         execution_required = bool(path.required_capabilities or plan.required_capabilities or plan.steps)
         execution_ok = bool(execution_results) and all(item.status == "success" for item in execution_results)
-        decision = decide_loop_action(
-            state=redteam_state,
-            evidence_level=state.evidence_level,
-            gate_ok=artifact_gate.passed and tool_gate.passed,
-            verify_passed=artifact_gate.passed and (execution_ok if execution_required else False),
-            taskbook={"todo_items": [{"id": state.current_task_id or "task-1"}]},
-            current_task_id=state.current_task_id or "task-1",
+        verify_ok = execution_ok if execution_required else True
+        if not execution_required:
+            execution_gate = GateResult(
+                gate_name="Execution Gate",
+                grade="pass",
+                reasons=("execution_not_required",),
+                next_required_action="advance",
+            )
+        elif execution_ok:
+            execution_gate = GateResult(
+                gate_name="Execution Gate",
+                grade="pass",
+                reasons=("execution_succeeded",),
+                next_required_action="advance",
+            )
+        elif not execution_results:
+            execution_gate = GateResult(
+                gate_name="Execution Gate",
+                grade="soft_fail",
+                reasons=("execution_not_attempted",),
+                next_required_action="register_adapter_or_retry",
+            )
+        else:
+            execution_gate = GateResult(
+                gate_name="Execution Gate",
+                grade="soft_fail",
+                reasons=("execution_incomplete",),
+                next_required_action="retry_or_fallback",
+            )
+        failed_results = [item for item in execution_results if item.status in {"failed", "blocked", "skipped"}]
+        if failed_results:
+            first = failed_results[0]
+            missing = tuple(
+                dict.fromkeys(
+                    item.error or item.summary or item.status
+                    for item in failed_results
+                    if item.error or item.summary or item.status
+                )
+            )
+            execution_gate = GateResult(
+                gate_name="Execution Gate",
+                grade="blocked" if first.status == "blocked" else "soft_fail",
+                missing=missing,
+                reasons=missing or (first.status,),
+                next_required_action=first.next_hint or "fix_execution_path",
+                hint=first.error or first.summary or first.status,
+            )
+        next_action = getattr(path, "next_action", "")
+        rhythm_gate = evaluate_rhythm_gate(
+            stagnation_count=state.stagnation_count,
+            pivot_hints=(next_action,) if next_action else (),
         )
+        control_gate = aggregate_gates(artifact_gate, tool_gate, *scope_gate_results, execution_gate, rhythm_gate)
+        if control_gate.is_blocked:
+            from hooks.core.loop_engine import LoopDecision
+            decision = LoopDecision(
+                action="blocked",
+                reason="control_gate_blocked",
+                next_stage=state.workflow_stage,
+                next_step=control_gate.next_required_action or "resolve_blocking_gate",
+                trigger="control_gate_blocked",
+                feedback_gate=",".join(control_gate.reasons) or control_gate.hint or "Control Gate",
+                exit_condition="resolve_blocking_gate",
+                required_artifact=",".join(control_gate.missing),
+            )
+        elif control_gate.should_pivot:
+            from hooks.core.loop_engine import LoopDecision
+            decision = LoopDecision(
+                action="pivot",
+                reason="control_gate_pivot",
+                next_stage=state.workflow_stage,
+                next_step=control_gate.next_required_action or "use_pivot_hints",
+                trigger="control_gate_pivot",
+                feedback_gate=",".join(control_gate.reasons) or control_gate.hint or "Control Gate",
+                exit_condition="select_new_path",
+                required_artifact=",".join(control_gate.missing),
+            )
+        else:
+            decision = decide_loop_action(
+                state=redteam_state,
+                evidence_level="partial" if control_gate.grade == "soft_fail" else state.evidence_level,
+                gate_ok=control_gate.passed,
+                verify_passed=control_gate.passed and verify_ok,
+                taskbook={"todo_items": [{"id": state.current_task_id or "task-1"}]},
+                current_task_id=state.current_task_id or "task-1",
+            )
         self.recorder.record_decision(
             run_id=state.run_id,
             iteration=state.loop_iteration,
@@ -184,6 +266,10 @@ class LoopRuntime:
             **(state.notes if isinstance(state.notes, dict) else {}),
             "decision_path_reason": path.reason,
             "rhythm_reason": rhythm.reason,
+            "control_gate_grade": control_gate.grade,
+            "control_gate_action": control_gate.next_required_action,
+            "execution_gate_grade": execution_gate.grade,
+            "execution_gate_action": execution_gate.next_required_action,
         }
 
         updated = LoopRuntimeState(
@@ -205,7 +291,7 @@ class LoopRuntime:
             missing_capabilities=plan.missing_capabilities,
             recent_artifacts=available_artifacts,
             evidence_level="confirmed" if artifact_gate.passed else state.evidence_level,
-            gate_results=(artifact_gate, tool_gate, *scope_gate_results),
+            gate_results=(artifact_gate, tool_gate, *scope_gate_results, execution_gate, rhythm_gate),
             drift_score=rhythm.drift_score,
             rhythm_state=rhythm.state,
             stagnation_count=state.stagnation_count,
@@ -237,6 +323,7 @@ class LoopRuntime:
         if execution_results:
             statuses = ",".join(sorted({item.status for item in execution_results}))
             brief_lines.append(f"[execution:{statuses}]")
+        brief_lines.append(f"[rhythm-gate:{rhythm_gate.grade}]")
         brief_lines.append(f"[next-step:{decision.next_step}]")
 
         exited = decision.action in {"advance", "exit_skill", "report", "blocked"}
