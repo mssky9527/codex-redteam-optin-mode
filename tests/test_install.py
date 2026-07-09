@@ -1,0 +1,101 @@
+from __future__ import annotations
+
+import importlib.util
+import json
+import sys
+import tomllib
+from pathlib import Path
+
+
+REPO_ROOT = Path(__file__).resolve().parents[1]
+INSTALL_PATH = REPO_ROOT / "scripts" / "install.py"
+
+spec = importlib.util.spec_from_file_location("install_script", INSTALL_PATH)
+install = importlib.util.module_from_spec(spec)
+sys.modules[spec.name] = install
+assert spec.loader is not None
+spec.loader.exec_module(install)
+
+
+def test_merge_config_preserves_user_sections(tmp_path: Path) -> None:
+    target = tmp_path / "config.toml"
+    target.write_text(
+        """
+# user-owned config
+model = "gpt-5"
+
+[automation]
+mode = "active"
+
+[mcp_servers.ida-pro-mcp]
+command = "ida-mcp"
+
+[projects."/work/demo"]
+trust_level = "trusted"
+""".lstrip(),
+        encoding="utf-8",
+    )
+
+    install.merge_config_file(REPO_ROOT / "config.toml", target, dry_run=False)
+
+    merged = tomllib.loads(target.read_text(encoding="utf-8"))
+    assert merged["model"] == "gpt-5"
+    assert merged["model_instructions_file"] == "./instruction.ctf.md"
+    assert merged["features"]["hooks"] is True
+    assert merged["features"]["automation"] is True
+    assert merged["automation"]["mode"] == "active"
+    assert merged["automation"]["allow_restricted_actions"] is False
+    assert merged["mcp_servers"]["ida-pro-mcp"]["command"] == "ida-mcp"
+    assert merged["projects"]["/work/demo"]["trust_level"] == "trusted"
+
+
+def test_merge_config_accepts_utf8_bom(tmp_path: Path) -> None:
+    target = tmp_path / "config.toml"
+    target.write_bytes(b"\xef\xbb\xbf[automation]\nmode = \"active\"\n")
+
+    install.merge_config_file(REPO_ROOT / "config.toml", target, dry_run=False)
+
+    merged = tomllib.loads(target.read_text(encoding="utf-8"))
+    assert merged["automation"]["mode"] == "active"
+    assert merged["model_instructions_file"] == "./instruction.ctf.md"
+
+
+def test_upgrade_cleanup_preserves_config_from_previous_manifest(tmp_path: Path) -> None:
+    codex_home = tmp_path / ".codex"
+    agents_home = tmp_path / ".agents"
+    codex_home.mkdir()
+    config = codex_home / "config.toml"
+    instruction = codex_home / "instruction.ctf.md"
+    config.write_text("[automation]\nmode = \"active\"\n", encoding="utf-8")
+    instruction.write_text("managed instruction\n", encoding="utf-8")
+    install.manifest_path(codex_home).write_text(
+        json.dumps(
+            {
+                "managed_paths": [
+                    str(config),
+                    str(instruction),
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    install._SAFE_ROOTS.clear()
+    install._SAFE_ROOTS.extend([codex_home, agents_home, REPO_ROOT])
+
+    install.upgrade_cleanup(codex_home, agents_home, [], dry_run=False)
+
+    assert config.exists()
+    assert not instruction.exists()
+    assert not install.manifest_path(codex_home).exists()
+
+
+def test_manifest_tracks_config_as_merged_file(tmp_path: Path) -> None:
+    codex_home = tmp_path / ".codex"
+    managed = [codex_home / "instruction.ctf.md"]
+
+    install.write_manifest(codex_home, managed, dry_run=False)
+
+    payload = json.loads(install.manifest_path(codex_home).read_text(encoding="utf-8"))
+    assert str(codex_home / "config.toml") not in payload["managed_paths"]
+    assert str(codex_home / "config.toml") in payload["merged_files"]
