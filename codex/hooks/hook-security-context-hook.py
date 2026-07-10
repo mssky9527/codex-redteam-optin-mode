@@ -79,7 +79,7 @@ def main() -> None:
         context = f"{context}\n{build_recent_refusal_overlay()}"
     if result.overlay:
         context = f"{context}\n{result.overlay}"
-    print(emit_hook_json("UserPromptSubmit", context, inject_role_overlay=True, phase=result.state.phase))
+    print(emit_hook_json("UserPromptSubmit", context, inject_role_overlay=True, role_phase=result.state.phase))
 
 
 if __name__ == "__main__":

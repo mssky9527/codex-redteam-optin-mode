@@ -34,7 +34,7 @@ if str(HOOKS_PATH) not in sys.path:
     sys.path.insert(0, str(HOOKS_PATH))
 if str(CODEX_PATH) not in sys.path:
     sys.path.insert(0, str(CODEX_PATH))
-from core import controller, prompt_parser, refusal_backstop, runtime_paths, skill_card
+from core import controller, emitter, prompt_parser, refusal_backstop, runtime_paths, skill_card
 from session_patcher import patcher
 
 
@@ -53,6 +53,31 @@ def _write_session(path: Path, mtime: int) -> Path:
     path.write_text('{"type":"event_msg","payload":{}}\n', encoding="utf-8")
     os.utime(path, (mtime, mtime))
     return path
+
+
+@pytest.mark.parametrize("event", ["SessionStart", "UserPromptSubmit"])
+def test_context_hook_output_matches_codex_wire_schema(event: str) -> None:
+    rendered = json.loads(emitter.emit_hook_json(event, "context"))
+
+    assert set(rendered) == {"hookSpecificOutput"}
+    assert set(rendered["hookSpecificOutput"]) == {"hookEventName", "additionalContext"}
+    assert rendered["hookSpecificOutput"]["hookEventName"] == event
+    assert rendered["hookSpecificOutput"]["additionalContext"] == "context"
+
+
+def test_role_phase_is_used_only_inside_additional_context() -> None:
+    rendered = json.loads(
+        emitter.emit_hook_json(
+            "UserPromptSubmit",
+            "route context",
+            inject_role_overlay=True,
+            role_phase="web",
+        )
+    )
+
+    specific = rendered["hookSpecificOutput"]
+    assert set(specific) == {"hookEventName", "additionalContext"}
+    assert "Current phase: web" in specific["additionalContext"]
 
 
 def test_merge_config_preserves_user_sections(tmp_path: Path) -> None:
