@@ -19,19 +19,20 @@ def color(text:str,code:str)->str: return text if os.environ.get('NO_COLOR') els
 def info(msg:str)->None: print(color(f'[INFO] {msg}','36'))
 def good(msg:str)->None: print(color(f'[OK] {msg}','32'))
 def manifest_path(codex_home:Path)->Path: return codex_home/'redteam-install-manifest.json'
-def detect_codex_home(explicit:str|None)->Path: return Path(explicit).expanduser() if explicit else Path(os.environ.get('CODEX_HOME') or (Path.home()/'.codex'))
-def detect_agents_home(explicit:str|None)->Path: return Path(explicit).expanduser() if explicit else Path.home()/'.agents'
+def normalize_path(value:str|Path)->Path: return Path(value).expanduser().resolve(strict=False)
+def detect_codex_home(explicit:str|None)->Path: return normalize_path(explicit or os.environ.get('CODEX_HOME') or (Path.home()/'.codex'))
+def detect_agents_home(explicit:str|None)->Path: return normalize_path(explicit or (Path.home()/'.agents'))
 def resolve_install_paths(project_home:str|None,codex_home:str|None,agents_home:str|None)->tuple[Path,Path,Path]:
     if project_home:
-        project_root=Path(project_home).expanduser()
-        return project_root/'.codex', (Path(agents_home).expanduser() if agents_home else project_root/'.agents'), project_root/'AGENTS.md'
+        project_root=normalize_path(project_home)
+        return project_root/'.codex', (normalize_path(agents_home) if agents_home else project_root/'.agents'), project_root/'AGENTS.md'
     resolved_codex=detect_codex_home(codex_home)
     return resolved_codex, detect_agents_home(agents_home), resolved_codex/'AGENTS.md'
 def resolve_install_homes(project_home:str|None,codex_home:str|None,agents_home:str|None)->tuple[Path,Path]:
     codex_home,agents_home,_=resolve_install_paths(project_home,codex_home,agents_home)
     return codex_home,agents_home
 def resolve_log_root(codex_home:Path,explicit:str|None)->Path:
-    return Path(explicit).expanduser() if explicit else codex_home/'logs'/'codex-redteam'
+    return normalize_path(explicit) if explicit else normalize_path(codex_home/'logs'/'codex-redteam')
 def _is_within(path:Path,*roots:Path)->bool:
     resolved=path.resolve()
     return any(resolved == root.resolve() or str(resolved).startswith(str(root.resolve())+os.sep) for root in roots if root)
@@ -175,10 +176,16 @@ def load_manifest_targets(codex_home:Path)->list[Path]:
     if not manifest.exists(): return []
     try: data=json.loads(manifest.read_text(encoding='utf-8'))
     except (json.JSONDecodeError,OSError): return []
-    targets=[]; 
-    for raw in data.get('managed_paths',[]):
-        try: targets.append(Path(raw))
-        except TypeError: pass
+    if not isinstance(data,dict): info(f'ignore manifest managed_paths in {manifest}: expected a JSON object'); return []
+    raw_targets=data.get('managed_paths',[])
+    if not isinstance(raw_targets,list): info(f'ignore manifest managed_paths in {manifest}: expected a JSON array'); return []
+    targets=[]
+    for raw in raw_targets:
+        try:
+            target=Path(raw).expanduser()
+            if not target.is_absolute(): info(f'ignore manifest managed_paths in {manifest}: relative target {raw!r}'); return []
+            targets.append(target.resolve(strict=False))
+        except (TypeError,ValueError,OSError): info(f'ignore manifest managed_paths in {manifest}: invalid target {raw!r}'); return []
     return targets
 def write_manifest(codex_home:Path,agents_file:Path,agents_home:Path,targets:list[Path],log_root:Path,custom_skill_dirs_enabled:bool,dry_run:bool)->None:
     skills_root=agents_home/'skills'
@@ -207,7 +214,7 @@ def main()->None:
     repo_root=Path(__file__).resolve().parents[1]; codex_home,agents_home,agents_file=resolve_install_paths(args.project_home,args.codex_home,args.agents_home)
     log_root=resolve_log_root(codex_home,args.log_root)
     _SAFE_ROOTS.extend([codex_home, agents_home, repo_root])
-    if args.project_home: _SAFE_ROOTS.append(Path(args.project_home).expanduser())
+    if args.project_home: _SAFE_ROOTS.append(agents_file.parent)
     info(f'platform: {platform.system()}'); info(f'codex home: {codex_home}'); info(f'agents home: {agents_home}')
     info(f'AGENTS.md: {agents_file}')
     info(f'log root: {log_root}')

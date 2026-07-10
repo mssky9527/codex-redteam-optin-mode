@@ -286,6 +286,107 @@ def test_project_home_allows_custom_agents_home(tmp_path: Path) -> None:
     assert agents_file == project / "AGENTS.md"
 
 
+def test_relative_install_paths_are_resolved_before_manifest_and_hooks(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    project = tmp_path / "project"
+    agents_home = tmp_path / "shared-agents"
+    log_root = tmp_path / "logs"
+
+    subprocess.run(
+        [
+            sys.executable,
+            str(INSTALL_PATH),
+            "--project-home",
+            "project",
+            "--agents-home",
+            "shared-agents",
+            "--log-root",
+            "logs",
+            "--enable-custom-skill-dirs",
+        ],
+        cwd=tmp_path,
+        check=True,
+        stdout=subprocess.DEVNULL,
+    )
+
+    codex_home = project / ".codex"
+    payload = json.loads((codex_home / "redteam-install-manifest.json").read_text(encoding="utf-8"))
+    recorded_paths = [
+        *payload["managed_paths"],
+        *payload["merged_files"],
+        payload["skills_paths"]["skills_root"],
+        *payload["skills_paths"]["skill_dirs"],
+        payload["log_root"],
+    ]
+    assert all(Path(path).is_absolute() for path in recorded_paths)
+    assert payload["skills_paths"]["skills_root"] == str(agents_home / "skills")
+    assert payload["log_root"] == str(log_root)
+
+    hooks_payload = json.loads((codex_home / "hooks.json").read_text(encoding="utf-8"))
+    commands = [
+        hook["command"]
+        for entries in hooks_payload["hooks"].values()
+        for entry in entries
+        for hook in entry["hooks"]
+    ]
+    assert all(str(codex_home / "hooks") in command for command in commands)
+
+    monkeypatch.chdir(project)
+    assert runtime_paths.resolve_log_root(codex_home) == log_root
+    assert skill_card.resolve_skills_dir(codex_home) == agents_home / "skills"
+
+
+def test_relative_codex_home_environment_is_resolved_for_install(tmp_path: Path) -> None:
+    env = {**os.environ, "CODEX_HOME": "profile"}
+
+    subprocess.run(
+        [sys.executable, str(INSTALL_PATH), "--agents-home", "agents"],
+        cwd=tmp_path,
+        env=env,
+        check=True,
+        stdout=subprocess.DEVNULL,
+    )
+
+    codex_home = tmp_path / "profile"
+    payload = json.loads((codex_home / "redteam-install-manifest.json").read_text(encoding="utf-8"))
+    assert payload["log_root"] == str(codex_home / "logs" / "codex-redteam")
+    assert payload["skills_paths"]["skills_root"] == str(tmp_path / "agents" / "skills")
+    assert all(Path(path).is_absolute() for path in payload["managed_paths"])
+
+
+def test_relative_manifest_targets_are_rejected_as_a_group(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    codex_home = tmp_path / ".codex"
+    agents_home = tmp_path / ".agents"
+    codex_home.mkdir()
+    relative_user_file = tmp_path / "user-owned.txt"
+    relative_user_file.write_text("user data\n", encoding="utf-8")
+    current_target = codex_home / "instruction.ctf.md"
+    current_target.write_text("managed\n", encoding="utf-8")
+    install.manifest_path(codex_home).write_text(
+        json.dumps({"managed_paths": ["user-owned.txt", str(current_target)]}),
+        encoding="utf-8",
+    )
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(install, "_SAFE_ROOTS", [codex_home, agents_home, tmp_path])
+
+    install.upgrade_cleanup(
+        codex_home,
+        agents_home,
+        codex_home / "AGENTS.md",
+        [current_target],
+        dry_run=False,
+    )
+
+    assert relative_user_file.exists()
+    assert not current_target.exists()
+    assert not install.manifest_path(codex_home).exists()
+
+
 def test_project_home_install_writes_under_dot_dirs(tmp_path: Path) -> None:
     project = tmp_path / "project"
 
