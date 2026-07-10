@@ -4,18 +4,18 @@
 
 **Current release:** v1.1.6
 
-> Normal by default. Red-team mode is opt-in; once enabled, automation starts automatically by default.
+> Structured red-team routing is off by default and must be enabled explicitly. The base `instruction.ctf.md` security profile remains active in every mode.
 
-A lightweight, evidence-driven red team runtime/configuration layer for Codex. Ordinary coding, documentation, and research tasks stay in normal mode unless the user explicitly enables red-team mode. When enabled, Loop Runtime SKILL.md domain cards declare scope, boundaries, and exit evidence — not instructions.
+A lightweight, evidence-driven red team runtime/configuration layer for Codex. In normal mode, the base `instruction.ctf.md` profile remains active while additional prepoison context, structured `phase -> router -> pack -> leaf` routing, and the automation loop stay off. Explicitly enabling red-team mode activates those additional runtime layers.
 
 ## Why This Project
 
 Two common pitfalls in AI-assisted security work:
 
-1. **Pollution of normal operations** — persistent red-team hints or system prompts bleed into everyday coding, causing refusals or unwanted behavior.
+1. **Uncontrolled structured routing** — phase, pack, automation, or refusal-backstop context activates without an explicit mode command.
 2. **Context bloat** — heavy injection of offensive doctrine increases token cost without improving routing quality.
 
-This project solves both: **normal mode stays normal**, and red-team mode must be explicitly enabled. When enabled, SKILL.md Loop Runtime domain cards declare scope, boundaries, and exit evidence, while the 5-Phase engine drives evidence-based progression — not a monolithic prompt dump.
+This project keeps the structured runtime opt-in: normal mode retains the base `instruction.ctf.md` profile but does not inject additional prepoison, refusal-backstop, phase, pack, or automation context. When explicitly enabled, SKILL.md Loop Runtime domain cards declare scope, boundaries, and exit evidence, while the 5-Phase engine drives evidence-based progression.
 
 ## Core Features
 
@@ -174,6 +174,8 @@ python scripts/install.py   # second run: cleanup → fresh deploy → same stat
 enable red team mode
 ```
 
+Submit mode commands as a separate prompt. Enabling `redteam-light` or `redteam-full` injects the shared prepoison context once; each subsequent task prompt is routed independently through `phase -> router -> pack -> leaf`.
+
 ### Disable Red Team Mode
 
 ```text
@@ -183,11 +185,13 @@ enable red team mode
 disable red team mode
 ```
 
+Disabling the mode stops future structured routing. The base `instruction.ctf.md` profile and prior task context remain active; use `/clear` or start a new task to remove prior per-session context.
+
 ### Mode Reference
 
 | Mode | Default | Use Case |
 |------|---------|----------|
-| `normal` | Yes | Coding, documentation, general research |
+| `normal` | Yes | Base `instruction.ctf.md` profile active; additional prepoison, structured routing, backstop, and automation inactive |
 | `redteam-light` | No | Targeted security analysis, planning, review |
 | `redteam-full` | No | Constrained red team workflow, operations |
 

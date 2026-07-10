@@ -43,7 +43,10 @@ def main() -> None:
             print(
                 emit_hook_json(
                     "UserPromptSubmit",
-                    "[mode] Red-team mode disabled. Return to normal mode; do not inject offensive doctrine unless you explicitly enable it again.",
+                    "[mode] Structured red-team routing disabled for future turns. "
+                    "No new phase/router/pack/leaf context will be injected. "
+                    "The base instruction.ctf.md profile and previous task context remain active. "
+                    "Use /clear or start a new task to remove prior per-session context.",
                 )
             )
         else:
@@ -53,6 +56,7 @@ def main() -> None:
                 emit_hook_json(
                     "UserPromptSubmit",
                     f"[mode] Red-team mode enabled ({mode}). Future prompts will use phase -> router -> pack -> leaf routing until you explicitly disable it.",
+                    inject_prepoison=True,
                 )
             )
         return

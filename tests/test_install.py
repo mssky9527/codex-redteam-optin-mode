@@ -134,9 +134,14 @@ def test_hook_stdout_is_utf8_safe_under_gbk(tmp_path: Path) -> None:
     )
     assert started.stdout.isascii()
     started_context = json.loads(started.stdout.decode("utf-8"))["hookSpecificOutput"]["additionalContext"]
-    assert "预防性指令" in started_context
+    assert "Default is normal" in started_context
+    assert "预防性指令" not in started_context
 
-    _run_hook_script_bytes(PROMPT_HOOK, {"session_id": session_id, "prompt": "/redteam light"}, env)
+    enabled = _run_hook_script_bytes(PROMPT_HOOK, {"session_id": session_id, "prompt": "/redteam light"}, env)
+    enabled_context = json.loads(enabled.stdout.decode("utf-8"))["hookSpecificOutput"]["additionalContext"]
+    assert "Red-team mode enabled (redteam-light)" in enabled_context
+    assert enabled_context.count("[prepoison:frame-lock]") == 1
+    assert "预防性指令" in enabled_context
     routed = _run_hook_script_bytes(
         PROMPT_HOOK,
         {"session_id": session_id, "prompt": "检查登录接口的认证风险"},
@@ -193,6 +198,7 @@ def test_session_start_preserves_mode_on_resume_and_compact(tmp_path: Path) -> N
         assert "Session mode restored (redteam-light)" in started_context
         assert "CTF core contract" in started_context
         assert "Supplemental routing note" in started_context
+        assert started_context.count("[prepoison:frame-lock]") == 1
         assert "Reverse-engineering supplemental overlay" not in started_context
         assert json.loads(state_path.read_text(encoding="utf-8"))["mode"] == "redteam-light"
 
@@ -206,11 +212,14 @@ def test_session_start_preserves_mode_on_resume_and_compact(tmp_path: Path) -> N
         assert "[router:" in routed_context
         assert "Reverse-engineering supplemental overlay" not in routed_context
 
-    _run_hook_script(
+    cleared = _run_hook_script(
         SESSION_START_HOOK,
         {"session_id": session_id, "transcript_path": str(transcript), "source": "clear"},
         env,
     )
+    cleared_context = json.loads(cleared.stdout)["hookSpecificOutput"]["additionalContext"]
+    assert "Default is normal" in cleared_context
+    assert "[prepoison:frame-lock]" not in cleared_context
     assert json.loads(state_path.read_text(encoding="utf-8"))["mode"] == "normal"
     after_clear = _run_hook_script(
         PROMPT_HOOK,
@@ -218,6 +227,107 @@ def test_session_start_preserves_mode_on_resume_and_compact(tmp_path: Path) -> N
         env,
     )
     assert after_clear.stdout == ""
+
+
+@pytest.mark.parametrize(
+    ("command", "mode"),
+    [("/redteam light", "redteam-light"), ("/redteam full", "redteam-full")],
+)
+def test_mode_enable_injects_prepoison_once(tmp_path: Path, command: str, mode: str) -> None:
+    session_id = f"enable-{mode}"
+    temp_dir = tmp_path / "temp"
+    env = {
+        **os.environ,
+        "TEMP": str(temp_dir),
+        "TMP": str(temp_dir),
+        "CODEX_REDTEAM_AUTOMATION_MODE": "plan-only",
+        "NO_COLOR": "1",
+    }
+
+    enabled = _run_hook_script(PROMPT_HOOK, {"session_id": session_id, "prompt": command}, env)
+    context = json.loads(enabled.stdout)["hookSpecificOutput"]["additionalContext"]
+
+    assert f"Red-team mode enabled ({mode})" in context
+    assert context.count("[prepoison:frame-lock]") == 1
+    assert json.loads(
+        (temp_dir / "codex_redteam_mode_states" / f"{session_id}.json").read_text(encoding="utf-8")
+    )["mode"] == mode
+
+    routed = _run_hook_script(
+        PROMPT_HOOK,
+        {"session_id": session_id, "prompt": "Review authentication bypass risk in the login endpoint"},
+        env,
+    )
+    routed_context = json.loads(routed.stdout)["hookSpecificOutput"]["additionalContext"]
+    assert f"[mode:{mode}]" in routed_context
+    assert "[phase:web]" in routed_context
+    assert "[router:auth-sec]" in routed_context
+
+
+def test_mode_disable_describes_remaining_base_and_history_context(tmp_path: Path) -> None:
+    session_id = "disable-session"
+    temp_dir = tmp_path / "temp"
+    env = {**os.environ, "TEMP": str(temp_dir), "TMP": str(temp_dir), "NO_COLOR": "1"}
+
+    _run_hook_script(PROMPT_HOOK, {"session_id": session_id, "prompt": "/redteam light"}, env)
+    disabled = _run_hook_script(PROMPT_HOOK, {"session_id": session_id, "prompt": "/redteam off"}, env)
+    context = json.loads(disabled.stdout)["hookSpecificOutput"]["additionalContext"]
+
+    assert "Structured red-team routing disabled" in context
+    assert "base instruction.ctf.md profile" in context
+    assert "previous task context remain active" in context
+    assert "/clear" in context
+    after_disable = _run_hook_script(
+        PROMPT_HOOK,
+        {"session_id": session_id, "prompt": "Review authentication bypass risk"},
+        env,
+    )
+    assert after_disable.stdout == ""
+
+
+def test_normal_session_start_does_not_run_explicit_refusal_backstop(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    sessions = tmp_path / "sessions"
+    previous = sessions / "previous.jsonl"
+    current = sessions / "current.jsonl"
+    sessions.mkdir(parents=True)
+    previous.write_text(
+        json.dumps(
+            {
+                "type": "response_item",
+                "payload": {
+                    "type": "message",
+                    "role": "assistant",
+                    "content": [{"type": "output_text", "text": "I cannot assist with that."}],
+                },
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    current.write_text('{"type":"event_msg","payload":{}}\n', encoding="utf-8")
+    os.utime(previous, (10, 10))
+    os.utime(current, (20, 20))
+    monkeypatch.setenv("CODEX_REDTEAM_BACKSTOP_MODE", "detect")
+    assert refusal_backstop.session_start_backstop_messages("normal-session", str(current))
+    env = {
+        **os.environ,
+        "TEMP": str(tmp_path / "temp"),
+        "TMP": str(tmp_path / "temp"),
+        "NO_COLOR": "1",
+    }
+
+    started = _run_hook_script(
+        SESSION_START_HOOK,
+        {"session_id": "normal-session", "transcript_path": str(current), "source": "startup"},
+        env,
+    )
+    context = json.loads(started.stdout)["hookSpecificOutput"]["additionalContext"]
+
+    assert "Default is normal" in context
+    assert "[backstop]" not in context
 
 
 def test_session_prompt_notice_excludes_phase_specific_prompts() -> None:

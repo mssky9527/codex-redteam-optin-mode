@@ -34,8 +34,8 @@ def main() -> None:
     state = load_runtime_state(session_id=session_id) if source in {"resume", "compact"} else reset_runtime_state(session_id=session_id)
     if state.mode == "normal":
         context = (
-            "[mode] Default is normal. Red-team mode stays off until explicitly enabled. "
-            "When enabled, guidance stays lightweight and routes by phase -> router -> pack -> leaf. "
+            "[mode] Default is normal. Structured red-team routing stays off until explicitly enabled. "
+            "The base instruction.ctf.md security profile remains active in all modes. "
             "Use method only when it adds value. instruction.ctf.md remains highest priority."
         )
     else:
@@ -48,12 +48,14 @@ def main() -> None:
     if notice:
         context = f"{context}\n{notice}"
 
-    prepoison = build_prepoisoned_context()
-    context = f"{context}\n{prepoison}"
+    if state.mode in {"redteam-light", "redteam-full"}:
+        prepoison = build_prepoisoned_context()
+        if prepoison:
+            context = f"{context}\n{prepoison}"
 
-    backstop = session_start_backstop_messages(session_id, transcript_path=transcript_path)
-    if backstop:
-        context = f"{context}\n" + "\n".join(backstop)
+        backstop = session_start_backstop_messages(session_id, transcript_path=transcript_path)
+        if backstop:
+            context = f"{context}\n" + "\n".join(backstop)
     print(emit_hook_json("SessionStart", context))
 
 
