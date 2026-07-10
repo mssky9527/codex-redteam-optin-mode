@@ -68,20 +68,24 @@ def merge_config_text(template_text:str,existing_text:str)->str:
     existing=tomlkit.parse(existing_text) if existing_text.strip() else tomlkit.document()
     if not _merge_toml_missing(template,existing): return existing_text
     return tomlkit.dumps(existing)
+def prepare_config_merge(src:Path,dst:Path)->tuple[Path,str,str]:
+    template_text=src.read_text(encoding='utf-8-sig')
+    existing_text=dst.read_text(encoding='utf-8-sig') if dst.exists() else ''
+    return dst,existing_text,merge_config_text(template_text,existing_text)
 def backup_config_file(dst:Path,dry_run:bool)->Path:
     backup=dst.with_name(f'{dst.name}.{datetime.now().strftime("%Y%m%d%H%M%S")}.bak')
     info(f'backup {dst} -> {backup}')
     if not dry_run: shutil.copy2(dst,backup)
     return backup
-def merge_config_file(src:Path,dst:Path,dry_run:bool)->None:
-    info(f'merge {src} -> {dst}')
-    template_text=src.read_text(encoding='utf-8-sig')
-    existing_text=dst.read_text(encoding='utf-8-sig') if dst.exists() else ''
-    merged=merge_config_text(template_text,existing_text)
+def apply_config_merge(plan:tuple[Path,str,str],dry_run:bool)->None:
+    dst,existing_text,merged=plan
     if merged==existing_text: return
     if dst.exists(): backup_config_file(dst,dry_run)
     if dry_run: return
     dst.parent.mkdir(parents=True, exist_ok=True); dst.write_text(merged,encoding='utf-8')
+def merge_config_file(src:Path,dst:Path,dry_run:bool)->None:
+    info(f'merge {src} -> {dst}')
+    apply_config_merge(prepare_config_merge(src,dst),dry_run)
 def copy_tree(src:Path,dst:Path,dry_run:bool)->None:
     info(f'copy {src} -> {dst}')
     if dry_run: return
@@ -209,9 +213,11 @@ def main()->None:
     info(f'log root: {log_root}')
     current_targets=managed_targets(repo_root,codex_home,agents_home)
     if args.uninstall: uninstall(repo_root,codex_home,agents_home,agents_file,args.dry_run); good('uninstall complete'); return
+    info(f"preflight config merge {repo_root/'config.toml'} -> {codex_home/'config.toml'}")
+    config_plan=prepare_config_merge(repo_root/'config.toml', codex_home/'config.toml')
     upgrade_cleanup(codex_home,agents_home,agents_file,current_targets,args.dry_run)
     if agents_file != codex_home/'AGENTS.md': remove_agents_block(codex_home/'AGENTS.md',args.dry_run)
-    copy_file(repo_root/'instruction.ctf.md', codex_home/'instruction.ctf.md', args.dry_run); merge_config_file(repo_root/'config.toml', codex_home/'config.toml', args.dry_run); seed_prompt_files(repo_root,codex_home,args.dry_run); upsert_agents_file(repo_root,agents_file,args.dry_run)
+    copy_file(repo_root/'instruction.ctf.md', codex_home/'instruction.ctf.md', args.dry_run); info(f"merge {repo_root/'config.toml'} -> {codex_home/'config.toml'}"); apply_config_merge(config_plan,args.dry_run); seed_prompt_files(repo_root,codex_home,args.dry_run); upsert_agents_file(repo_root,agents_file,args.dry_run)
     copy_file(repo_root/'codex'/'hooks'/'session-start-context.py', codex_home/'hooks'/'session-start-context.py', args.dry_run)
     copy_file(repo_root/'codex'/'hooks'/'hook-security-context-hook.py', codex_home/'hooks'/'hook-security-context-hook.py', args.dry_run)
     copy_file(repo_root/'codex'/'hooks'/'redteam_state.py', codex_home/'hooks'/'redteam_state.py', args.dry_run)

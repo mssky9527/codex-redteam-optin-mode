@@ -170,6 +170,42 @@ def test_merge_config_invalid_existing_toml_does_not_backup_or_write(tmp_path: P
     assert list(tmp_path.glob("config.toml.*.bak")) == []
 
 
+def test_install_invalid_existing_toml_fails_before_writes_or_cleanup(tmp_path: Path) -> None:
+    codex_home = tmp_path / "custom-codex"
+    agents_home = tmp_path / "custom-agents"
+    codex_home.mkdir()
+    original = "[automation\nmode = \"active\"\n"
+    (codex_home / "config.toml").write_text(original, encoding="utf-8")
+    stale = codex_home / "stale-managed.txt"
+    stale.write_text("old managed file\n", encoding="utf-8")
+    manifest = codex_home / "redteam-install-manifest.json"
+    manifest.write_text(json.dumps({"managed_paths": [str(stale)]}), encoding="utf-8")
+
+    result = subprocess.run(
+        [
+            sys.executable,
+            str(INSTALL_PATH),
+            "--codex-home",
+            str(codex_home),
+            "--agents-home",
+            str(agents_home),
+        ],
+        cwd=REPO_ROOT,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+
+    assert result.returncode != 0
+    assert (codex_home / "config.toml").read_text(encoding="utf-8") == original
+    assert list(codex_home.glob("config.toml.*.bak")) == []
+    assert not (codex_home / "instruction.ctf.md").exists()
+    assert not (codex_home / "hooks").exists()
+    assert not (codex_home / "AGENTS.md").exists()
+    assert not agents_home.exists()
+    assert stale.exists()
+    assert manifest.exists()
+
+
 def test_upgrade_cleanup_preserves_config_from_previous_manifest(tmp_path: Path) -> None:
     codex_home = tmp_path / ".codex"
     agents_home = tmp_path / ".agents"
