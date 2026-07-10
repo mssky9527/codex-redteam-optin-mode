@@ -2,7 +2,7 @@
 
 [English](./README.md)
 
-**当前版本：** v1.1.3
+**当前版本：** v1.1.4
 
 > 默认 normal 模式。红队模式必须显式开启；一旦进入红队模式，自动化能力默认自动启动。
 
@@ -115,7 +115,7 @@ python scripts/install.py --uninstall
 
 ### 安装器做了什么
 
-1. **配置预检** — 在复制或清理任何文件前，先解析并规划 `config.toml` 合并；已有 TOML 非法时，安装会失败且不留下部分安装痕迹
+1. **配置预检** — 在复制或清理任何文件前，先解析并规划 `config.toml` 与 `hooks.json` 合并；已有配置非法时，安装会失败且不留下部分安装痕迹
 2. **升级清理** — 读取选定 Codex Home 中上次安装的 manifest（`<codex-home>/redteam-install-manifest.json`），移除所有旧版本托管路径，外加已知历史残留（`legacy-redteam-hook.py`、`red-team-command-doctrine-old`）
 3. **核心文件** — 复制 `instruction.ctf.md`，并将 `config.toml` 合并到选定的 Codex Home（`~/.codex/`、自定义 `--codex-home` 或 `<project>/.codex/`）
 4. **Hooks** — 部署 `session-start-context.py`、`hook-security-context-hook.py`、`redteam_state.py`、`core/` 到选定 Codex Home 的 `hooks/`
@@ -135,7 +135,8 @@ python scripts/install.py --uninstall
 - 版本升级干净，同时不触碰用户自己的文件
 - `config.toml` 使用合并而不是覆盖；已有用户配置会保留，实际修改已有配置前会创建 `config.toml.YYYYMMDDHHMMSS.bak` 备份
 - `config.toml` 合并使用 `tomlkit`，避免 `[[skills.config]]` 等数组表吞入本应属于 `[automation]` 的键
-- 已有 `config.toml` 非法时会在预检阶段失败，不会复制新文件，也不会清理上次安装 manifest 中记录的路径
+- 已有 `config.toml` 或 `hooks.json` 非法时会在预检阶段失败，不会复制新文件，也不会清理上次安装 manifest 中记录的路径；支持带 UTF-8 BOM 的 hooks
+- 相对安装参数以安装命令的工作目录为基准解析，生成的 hooks 和 manifest 字段均使用绝对路径
 - `copy_tree` 整目录替换托管目录（`router/`、`orchestrator/` 等），skill 目录仅复制 `SKILL.md`
 - `AGENTS.md`、`hooks.json` 和 `config.toml` 不会被升级清理删除——使用合并逻辑，用户自定义内容不受影响
 - 项目级安装会将 managed AGENTS block 放在 `<project>/AGENTS.md`；旧的 `<project>/.codex/AGENTS.md` managed block 会安全迁移

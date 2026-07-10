@@ -2,7 +2,7 @@
 
 [中文说明](./README_ZH.md)
 
-**Current release:** v1.1.3
+**Current release:** v1.1.4
 
 > Normal by default. Red-team mode is opt-in; once enabled, automation starts automatically by default.
 
@@ -114,7 +114,7 @@ Use `--project-home /path/to/project` for project-level installs. Do not use `--
 
 ### What the Installer Does
 
-1. **Config preflight** — parses and plans the `config.toml` merge before copying or cleaning any files, so invalid existing TOML leaves the install untouched
+1. **Configuration preflight** — parses and plans both `config.toml` and `hooks.json` merges before copying or cleaning any files, so invalid existing configuration leaves the install untouched
 2. **Upgrade cleanup** — reads the manifest from the selected Codex Home (`<codex-home>/redteam-install-manifest.json`), removes all old tracked paths, plus known legacy remnants (`legacy-redteam-hook.py`, `red-team-command-doctrine-old`)
 3. **Core files** — copies `instruction.ctf.md` and merges `config.toml` into the selected Codex Home (`~/.codex/`, custom `--codex-home`, or `<project>/.codex/`)
 4. **Hooks** — deploys `session-start-context.py`, `hook-security-context-hook.py`, `redteam_state.py`, and `core/` to the selected Codex Home's `hooks/`
@@ -134,7 +134,8 @@ On each run, it reads the previous manifest, removes only project-managed files 
 - Version upgrades are clean without touching user-owned files
 - `config.toml` is merged instead of overwritten; existing user settings are preserved, and changed existing configs are backed up as `config.toml.YYYYMMDDHHMMSS.bak`
 - `config.toml` merging uses `tomlkit` so array tables such as `[[skills.config]]` do not receive keys meant for `[automation]`
-- Invalid existing `config.toml` fails during preflight before files are copied or previous manifest paths are cleaned
+- Invalid existing `config.toml` or `hooks.json` fails during preflight before files are copied or previous manifest paths are cleaned; UTF-8 BOM-prefixed hooks are accepted
+- Relative install arguments are resolved against the install command's working directory, and generated hooks and manifest fields use absolute paths
 - `copy_tree` replaces managed directories (`router/`, `orchestrator/`, etc.) wholesale; skill directories copy only `SKILL.md`
 - `AGENTS.md`, `hooks.json`, and `config.toml` are never deleted by upgrade cleanup — they use merge logic so user customizations survive
 - Project installs place the managed AGENTS block in `<project>/AGENTS.md`; old `<project>/.codex/AGENTS.md` managed blocks are migrated safely
