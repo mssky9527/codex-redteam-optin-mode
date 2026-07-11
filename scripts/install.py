@@ -16,6 +16,7 @@ APP_NAME='codex-redteam-optin-mode'; APP_VERSION='1.1.6'
 AGENTS_BLOCK_START='<!-- codex-redteam-optin-mode:start -->'; AGENTS_BLOCK_END='<!-- codex-redteam-optin-mode:end -->'
 SESSION_STATUS='Loading session mode context'; PROMPT_STATUS='Checking mode-gated offensive routing'
 _MISSING=object()
+class ManifestValidationError(ValueError): pass
 def color(text:str,code:str)->str: return text if os.environ.get('NO_COLOR') else f'\033[{code}m{text}\033[0m'
 def info(msg:str)->None: print(color(f'[INFO] {msg}','36'))
 def warn(msg:str)->None: print(color(f'[WARN] {msg}','33'))
@@ -292,9 +293,11 @@ def merge_hooks_json(repo_root:Path,codex_home:Path,dry_run:bool)->None:
     plan=prepare_hooks_merge(repo_root,codex_home); info(f'apply hooks merge -> {plan[0]}'); apply_hooks_plan(plan,dry_run)
 def remove_managed_hooks(codex_home:Path,dry_run:bool)->None:
     plan=prepare_hooks_removal(codex_home); info(f'apply managed hook removal -> {plan[0]}'); apply_hooks_plan(plan,dry_run)
-def run_validate(repo_root:Path,codex_home:Path,dry_run:bool)->None:
+def run_validate(repo_root:Path,codex_home:Path,dry_run:bool,manifest_candidate:Path|None=None)->None:
     if dry_run: return
-    subprocess.run([sys.executable, str(repo_root/'scripts'/'validate.py'), '--codex-home', str(codex_home)], check=True)
+    command=[sys.executable,str(repo_root/'scripts'/'validate.py'),'--codex-home',str(codex_home)]
+    if manifest_candidate is not None: command.extend(['--manifest',str(manifest_candidate)])
+    subprocess.run(command,check=True)
 def repo_skill_dirs(repo_root:Path)->list[Path]:
     skills_root=repo_root/'agents'/'skills'; return sorted(path for path in skills_root.iterdir() if path.is_dir()) if skills_root.exists() else []
 def managed_targets(repo_root:Path,codex_home:Path,agents_home:Path)->list[Path]:
@@ -321,34 +324,49 @@ def load_manifest_data(codex_home:Path)->dict:
     manifest=manifest_path(codex_home)
     if not manifest.exists(): return {}
     try: data=json.loads(manifest.read_text(encoding='utf-8'))
-    except (json.JSONDecodeError,OSError): return {}
-    if not isinstance(data,dict): info(f'ignore manifest data in {manifest}: expected a JSON object'); return {}
+    except (json.JSONDecodeError,OSError) as exc: raise ManifestValidationError(f'invalid install manifest at {manifest}: {exc}') from exc
+    if not isinstance(data,dict): raise ManifestValidationError(f'invalid install manifest at {manifest}: expected a JSON object')
+    raw_targets=data.get('managed_paths')
+    if not isinstance(raw_targets,list): raise ManifestValidationError(f'invalid install manifest at {manifest}: managed_paths must be a JSON array')
+    for raw in raw_targets:
+        if not isinstance(raw,str) or not raw.strip(): raise ManifestValidationError(f'invalid install manifest at {manifest}: managed_paths entries must be non-empty strings')
+        try: target=Path(raw).expanduser()
+        except (TypeError,ValueError,OSError) as exc: raise ManifestValidationError(f'invalid install manifest at {manifest}: invalid managed path {raw!r}') from exc
+        if not target.is_absolute(): raise ManifestValidationError(f'invalid install manifest at {manifest}: managed path must be absolute: {raw!r}')
     return data
 def load_manifest_targets(codex_home:Path)->list[Path]:
     manifest=manifest_path(codex_home); data=load_manifest_data(codex_home)
     if not data: return []
-    raw_targets=data.get('managed_paths',[])
-    if not isinstance(raw_targets,list): info(f'ignore manifest managed_paths in {manifest}: expected a JSON array'); return []
     targets=[]
-    for raw in raw_targets:
+    for raw in data['managed_paths']:
         try:
             target=Path(raw).expanduser()
-            if not target.is_absolute(): info(f'ignore manifest managed_paths in {manifest}: relative target {raw!r}'); return []
             targets.append(target.resolve(strict=False))
-        except (TypeError,ValueError,OSError): info(f'ignore manifest managed_paths in {manifest}: invalid target {raw!r}'); return []
+        except (TypeError,ValueError,OSError) as exc: raise ManifestValidationError(f'invalid install manifest at {manifest}: invalid managed path {raw!r}') from exc
     return targets
-def write_manifest(codex_home:Path,agents_file:Path,agents_home:Path,targets:list[Path],log_root:Path,custom_skill_dirs_enabled:bool,dry_run:bool,config_merge:dict|None=None)->None:
+def build_manifest_payload(codex_home:Path,agents_file:Path,agents_home:Path,targets:list[Path],log_root:Path,custom_skill_dirs_enabled:bool,config_merge:dict|None=None)->dict:
     skills_root=agents_home/'skills'
     skill_dirs=[str(skills_root/path.name) for path in repo_skill_dirs(Path(__file__).resolve().parents[1])]
-    manifest=manifest_path(codex_home); payload={'name':APP_NAME,'version':APP_VERSION,'manifest_schema_version':2,'installed_at':datetime.now().isoformat(timespec='seconds'),'managed_paths':[str(path) for path in targets],'merged_files':[str(agents_file),str(codex_home/'hooks.json'),str(codex_home/'config.toml')],'skills_paths':{'skills_root':str(skills_root),'skill_dirs':skill_dirs},'custom_skill_dirs_enabled':bool(custom_skill_dirs_enabled),'log_root':str(log_root),'config_merge':config_merge or {'path':str((codex_home/'config.toml').resolve(strict=False)),'existed_before':True,'added_values':[],'added_tables':[]}}
-    info(f'write manifest {manifest}')
-    if dry_run: return
-    manifest.parent.mkdir(parents=True, exist_ok=True); manifest.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding='utf-8')
+    return {'name':APP_NAME,'version':APP_VERSION,'manifest_schema_version':2,'installed_at':datetime.now().isoformat(timespec='seconds'),'managed_paths':[str(path) for path in targets],'merged_files':[str(agents_file),str(codex_home/'hooks.json'),str(codex_home/'config.toml')],'skills_paths':{'skills_root':str(skills_root),'skill_dirs':skill_dirs},'custom_skill_dirs_enabled':bool(custom_skill_dirs_enabled),'log_root':str(log_root),'config_merge':config_merge or {'path':str((codex_home/'config.toml').resolve(strict=False)),'existed_before':True,'added_values':[],'added_tables':[]}}
+def prepare_manifest(codex_home:Path,agents_file:Path,agents_home:Path,targets:list[Path],log_root:Path,custom_skill_dirs_enabled:bool,dry_run:bool,config_merge:dict|None=None)->tuple[Path,Path]|None:
+    manifest=manifest_path(codex_home); candidate=manifest.with_name(f'{manifest.name}.tmp'); info(f'prepare manifest {candidate}')
+    if dry_run: return None
+    payload=build_manifest_payload(codex_home,agents_file,agents_home,targets,log_root,custom_skill_dirs_enabled,config_merge)
+    manifest.parent.mkdir(parents=True,exist_ok=True); candidate.write_text(json.dumps(payload,ensure_ascii=False,indent=2),encoding='utf-8')
+    return manifest,candidate
+def commit_manifest(plan:tuple[Path,Path]|None,dry_run:bool)->None:
+    if dry_run or plan is None: return
+    manifest,candidate=plan; info(f'commit manifest {manifest}'); os.replace(candidate,manifest)
+def discard_manifest(plan:tuple[Path,Path]|None)->None:
+    if plan is None: return
+    candidate=plan[1]
+    if candidate.exists(): candidate.unlink()
+def write_manifest(codex_home:Path,agents_file:Path,agents_home:Path,targets:list[Path],log_root:Path,custom_skill_dirs_enabled:bool,dry_run:bool,config_merge:dict|None=None)->None:
+    plan=prepare_manifest(codex_home,agents_file,agents_home,targets,log_root,custom_skill_dirs_enabled,dry_run,config_merge); commit_manifest(plan,dry_run)
 def upgrade_cleanup(codex_home:Path,agents_home:Path,agents_file:Path,default_targets:list[Path],dry_run:bool)->None:
-    manifest=manifest_path(codex_home); previous_targets=load_manifest_targets(codex_home); cleanup_targets=previous_targets or default_targets; protected={str(agents_file), str(codex_home/'AGENTS.md'), str(codex_home/'hooks.json'), str(codex_home/'config.toml')}
+    previous_targets=load_manifest_targets(codex_home); cleanup_targets=previous_targets or default_targets; protected={str(agents_file), str(codex_home/'AGENTS.md'), str(codex_home/'hooks.json'), str(codex_home/'config.toml')}
     cleanup_targets=_unique_cleanup_targets(cleanup_targets + legacy_cleanup_targets(codex_home,agents_home),protected)
     preflight_cleanup_targets(cleanup_targets,'upgrade cleanup')
-    remove_path(manifest,dry_run)
     for target in cleanup_targets: remove_path(target,dry_run)
 def uninstall(repo_root:Path,codex_home:Path,agents_home:Path,agents_file:Path,dry_run:bool)->None:
     manifest_data=load_manifest_data(codex_home)
@@ -399,5 +417,13 @@ def main()->None:
     copy_tree(repo_root/'codex'/'automation', codex_home/'automation', args.dry_run)
     copy_tree(repo_root/'codex'/'session_patcher', codex_home/'session_patcher', args.dry_run)
     for skill_dir in repo_skill_dirs(repo_root): copy_skill_md(skill_dir, agents_home/'skills'/skill_dir.name, args.dry_run)
-    info(f'apply hooks merge -> {hooks_plan[0]}'); apply_hooks_plan(hooks_plan,args.dry_run); write_manifest(codex_home,agents_file,agents_home,current_targets,log_root,args.enable_custom_skill_dirs,args.dry_run,config_plan[3]); run_validate(repo_root,codex_home,args.dry_run); good('install complete')
-if __name__=='__main__': main()
+    info(f'apply hooks merge -> {hooks_plan[0]}'); apply_hooks_plan(hooks_plan,args.dry_run)
+    manifest_plan=prepare_manifest(codex_home,agents_file,agents_home,current_targets,log_root,args.enable_custom_skill_dirs,args.dry_run,config_plan[3])
+    try: run_validate(repo_root,codex_home,args.dry_run,manifest_plan[1] if manifest_plan else None)
+    except BaseException:
+        discard_manifest(manifest_plan); raise
+    commit_manifest(manifest_plan,args.dry_run); good('install complete')
+if __name__=='__main__':
+    try: main()
+    except ManifestValidationError as exc:
+        print(f'ERROR: {exc}',file=sys.stderr); raise SystemExit(2)

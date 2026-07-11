@@ -125,8 +125,8 @@ def check_file(codex_root: Path, relative: str) -> Tuple[bool, str]:
     return False, f"  MISS {relative}"
 
 
-def _manifest_skill_dir(repo_root: Path) -> Path | None:
-    manifest = repo_root / "redteam-install-manifest.json"
+def _manifest_skill_dir(repo_root: Path, manifest_override: Path | None = None) -> Path | None:
+    manifest = manifest_override or repo_root / "redteam-install-manifest.json"
     if not manifest.exists():
         return None
     try:
@@ -143,8 +143,8 @@ def _manifest_skill_dir(repo_root: Path) -> Path | None:
     return None
 
 
-def _manifest_merged_file(codex_home: Path, filename: str) -> Path | None:
-    manifest = codex_home / "redteam-install-manifest.json"
+def _manifest_merged_file(codex_home: Path, filename: str, manifest_override: Path | None = None) -> Path | None:
+    manifest = manifest_override or codex_home / "redteam-install-manifest.json"
     if not manifest.exists():
         return None
     try:
@@ -161,11 +161,11 @@ def _manifest_merged_file(codex_home: Path, filename: str) -> Path | None:
     return None
 
 
-def _resolve_skills_dir(repo_root: Path, source_tree_mode: bool) -> Path | None:
+def _resolve_skills_dir(repo_root: Path, source_tree_mode: bool, manifest_override: Path | None = None) -> Path | None:
     repo_skills = repo_root / "agents" / "skills"
     if repo_skills.exists():
         return repo_skills
-    manifest_skills = _manifest_skill_dir(repo_root)
+    manifest_skills = _manifest_skill_dir(repo_root, manifest_override)
     if manifest_skills and manifest_skills.exists():
         return manifest_skills
     default_agents = Path.home() / ".agents" / "skills"
@@ -188,7 +188,7 @@ def _resolve_runtime_skills_dir(codex_root: Path, source_tree_mode: bool) -> Pat
     return resolve_skills_dir(codex_root)
 
 
-def validate_install(codex_home: Path) -> Tuple[bool, List[str]]:
+def validate_install(codex_home: Path, manifest_override: Path | None = None) -> Tuple[bool, List[str]]:
     messages: List[str] = []
     all_ok = True
 
@@ -242,7 +242,7 @@ def validate_install(codex_home: Path) -> Tuple[bool, List[str]]:
             messages.append("hooks.json: MISSING")
             all_ok = False
 
-    agents_path = _manifest_merged_file(codex_home, "AGENTS.md") or repo_root / "AGENTS.md"
+    agents_path = _manifest_merged_file(codex_home, "AGENTS.md", manifest_override) or repo_root / "AGENTS.md"
     if agents_path.exists():
         content = agents_path.read_text(encoding="utf-8")
         if "codex-redteam-optin-mode:start" in content:
@@ -268,7 +268,7 @@ def validate_install(codex_home: Path) -> Tuple[bool, List[str]]:
         messages.append("config.toml: MISSING")
         all_ok = False
 
-    skills_dir = _resolve_skills_dir(repo_root, source_tree_mode)
+    skills_dir = _resolve_skills_dir(repo_root, source_tree_mode, manifest_override)
     if skills_dir is not None:
         messages.append("")
         messages.append(f"Installed skill cards: {skills_dir}")
@@ -332,6 +332,11 @@ def main() -> None:
         required=False,
         help="Path to the codex home directory",
     )
+    parser.add_argument(
+        "--manifest",
+        required=False,
+        help="Candidate install manifest used during pre-commit validation",
+    )
     args = parser.parse_args()
 
     codex_home = Path(args.codex_home) if args.codex_home else Path.home() / ".codex"
@@ -339,7 +344,8 @@ def main() -> None:
         print(f"ERROR: codex home directory does not exist: {codex_home}")
         sys.exit(1)
 
-    all_ok, messages = validate_install(codex_home)
+    manifest_override = Path(args.manifest) if args.manifest else None
+    all_ok, messages = validate_install(codex_home, manifest_override)
     for msg in messages:
         print(msg)
 

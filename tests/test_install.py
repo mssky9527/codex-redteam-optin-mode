@@ -999,7 +999,7 @@ def test_upgrade_cleanup_preserves_config_from_previous_manifest(tmp_path: Path)
 
     assert config.exists()
     assert not instruction.exists()
-    assert not install.manifest_path(codex_home).exists()
+    assert install.manifest_path(codex_home).exists()
 
 
 def test_manifest_tracks_config_as_merged_file(tmp_path: Path) -> None:
@@ -1142,17 +1142,74 @@ def test_relative_manifest_targets_are_rejected_as_a_group(
     monkeypatch.chdir(tmp_path)
     monkeypatch.setattr(install, "_SAFE_ROOTS", [codex_home, agents_home, tmp_path])
 
-    install.upgrade_cleanup(
-        codex_home,
-        agents_home,
-        codex_home / "AGENTS.md",
-        [current_target],
-        dry_run=False,
-    )
+    with pytest.raises(install.ManifestValidationError, match="must be absolute"):
+        install.upgrade_cleanup(
+            codex_home,
+            agents_home,
+            codex_home / "AGENTS.md",
+            [current_target],
+            dry_run=False,
+        )
 
     assert relative_user_file.exists()
-    assert not current_target.exists()
-    assert not install.manifest_path(codex_home).exists()
+    assert current_target.exists()
+    assert install.manifest_path(codex_home).exists()
+
+
+@pytest.mark.parametrize(
+    "manifest_text",
+    ["{invalid json", "[]", "{}", '{"managed_paths":"not-a-list"}'],
+)
+def test_invalid_existing_manifest_fails_before_install_changes(tmp_path: Path, manifest_text: str) -> None:
+    codex_home = tmp_path / "codex-home"
+    agents_home = tmp_path / "agents-home"
+    codex_home.mkdir()
+    manifest = install.manifest_path(codex_home)
+    manifest.write_text(manifest_text, encoding="utf-8")
+    marker = codex_home / "user-marker.txt"
+    marker.write_text("keep\n", encoding="utf-8")
+
+    result = subprocess.run(
+        [sys.executable, str(INSTALL_PATH), "--codex-home", str(codex_home), "--agents-home", str(agents_home)],
+        cwd=REPO_ROOT,
+        capture_output=True,
+        text=True,
+    )
+
+    assert result.returncode == 2
+    assert "invalid install manifest" in result.stderr
+    assert manifest.read_text(encoding="utf-8") == manifest_text
+    assert marker.read_text(encoding="utf-8") == "keep\n"
+    assert not (codex_home / "instruction.ctf.md").exists()
+    assert not (codex_home / "hooks").exists()
+    assert not agents_home.exists()
+
+
+def test_validation_failure_keeps_previous_manifest(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    codex_home = tmp_path / "codex-home"
+    agents_home = tmp_path / "agents-home"
+    codex_home.mkdir()
+    stale = codex_home / "stale-managed.txt"
+    stale.write_text("stale\n", encoding="utf-8")
+    manifest = install.manifest_path(codex_home)
+    original = json.dumps({"managed_paths": [str(stale)]})
+    manifest.write_text(original, encoding="utf-8")
+
+    def fail_validation(*args: object, **kwargs: object) -> None:
+        raise RuntimeError("validation failed")
+
+    monkeypatch.setattr(install, "run_validate", fail_validation)
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [str(INSTALL_PATH), "--codex-home", str(codex_home), "--agents-home", str(agents_home)],
+    )
+
+    with pytest.raises(RuntimeError, match="validation failed"):
+        install.main()
+
+    assert manifest.read_text(encoding="utf-8") == original
+    assert not manifest.with_name(f"{manifest.name}.tmp").exists()
 
 
 def test_project_home_install_writes_under_dot_dirs(tmp_path: Path) -> None:
