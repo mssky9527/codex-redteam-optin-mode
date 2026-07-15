@@ -1,6 +1,7 @@
 from __future__ import annotations
-import argparse, base64, copy, json, os, platform, re, shlex, shutil, subprocess, sys
+import argparse, base64, copy, hashlib, json, os, platform, re, shlex, shutil, subprocess, sys
 from datetime import datetime
+from fnmatch import fnmatchcase
 from pathlib import Path
 try:
     import tomlkit
@@ -15,6 +16,10 @@ except ModuleNotFoundError as exc:
 APP_NAME='codex-redteam-optin-mode'; APP_VERSION='1.3.0'
 AGENTS_BLOCK_START='<!-- codex-redteam-optin-mode:start -->'; AGENTS_BLOCK_END='<!-- codex-redteam-optin-mode:end -->'
 SESSION_STATUS='Loading session mode context'; PROMPT_STATUS='Checking mode-gated offensive routing'
+SYSTEM_INSTRUCTIONS_CONFIG_VALUE='./redteam-mode/system-instructions.md'
+SYSTEM_PROFILE_START='<!-- codex-redteam-system-profile:start -->'; SYSTEM_PROFILE_END='<!-- codex-redteam-system-profile:end -->'
+MODEL_CATALOG_START='<!-- codex-redteam-model-profiles:start -->'; MODEL_CATALOG_END='<!-- codex-redteam-model-profiles:end -->'
+DEFAULT_MODEL_PROFILE_FILES={'gpt-5.6*':'Jailbreak.gpt-5.6.md','gpt-5.5*':'Jailbreak.gpt-5.5.md','gpt-5.4*':'Jailbreak.gpt-5.4.md','default':'Jailbreak.default.md'}
 _MISSING=object()
 class ManifestValidationError(ValueError): pass
 def configure_stdio()->None:
@@ -68,6 +73,118 @@ def _toml_container(value:object)->bool:
     return hasattr(value,'items')
 def _toml_plain(value:object)->object:
     return value.unwrap() if hasattr(value,'unwrap') else value
+def _read_toml_document(path:Path)->object:
+    if not path.is_file(): return tomlkit.document()
+    return tomlkit.parse(path.read_text(encoding='utf-8-sig'))
+def _config_string(path:Path,key:str)->str:
+    try: value=_read_toml_document(path).get(key)
+    except (OSError,TomlParseError): return ''
+    plain=_toml_plain(value)
+    return plain.strip() if isinstance(plain,str) else ''
+def _configured_profile_mapping(path:Path)->dict[str,str]:
+    try: document=_read_toml_document(path)
+    except (OSError,TomlParseError): return {}
+    redteam=document.get('redteam'); configured=redteam.get('model_prompt_profiles') if hasattr(redteam,'get') else None
+    if not hasattr(configured,'items'): return {}
+    return {str(pattern).strip():str(_toml_plain(filename)).strip() for pattern,filename in configured.items() if str(pattern).strip() and isinstance(_toml_plain(filename),str) and str(_toml_plain(filename)).strip()}
+def resolve_install_model(repo_root:Path,codex_home:Path,explicit:str|None,previous_system_prompt:dict|None=None)->tuple[str,str]:
+    previous_model=previous_system_prompt.get('model','').strip() if isinstance(previous_system_prompt,dict) and isinstance(previous_system_prompt.get('model'),str) else ''
+    candidates=[('argument',(explicit or '').strip()),('environment',os.environ.get('CODEX_MODEL','').strip()),('target-config',_config_string(codex_home/'config.toml','model')),('manifest',previous_model),('source-config',_config_string(repo_root/'config.toml','model'))]
+    for source,value in candidates:
+        if value: return value,source
+    return 'unknown','default'
+def model_profile_mapping(repo_root:Path,codex_home:Path)->dict[str,str]:
+    mapping=dict(DEFAULT_MODEL_PROFILE_FILES); configured=_configured_profile_mapping(codex_home/'config.toml')
+    if not configured: configured=_configured_profile_mapping(repo_root/'config.toml')
+    mapping.update(configured); return mapping
+def _owned_target_keys(targets:list[Path])->set[str]:
+    return {str(path.resolve(strict=False)).casefold() for path in targets}
+def resolve_profile_path(repo_root:Path,codex_home:Path,filename:str,owned_targets:list[Path])->tuple[str,Path]:
+    safe_filename=Path(filename).name; installed=codex_home/'prompts'/safe_filename; bundled=repo_root/'codex'/'prompts'/safe_filename; owned=_owned_target_keys(owned_targets)
+    if installed.is_file() and str(installed.resolve(strict=False)).casefold() not in owned: return safe_filename,installed
+    if bundled.is_file(): return safe_filename,bundled
+    if installed.is_file(): return safe_filename,installed
+    return safe_filename,bundled
+def select_model_profile(repo_root:Path,codex_home:Path,model:str,owned_targets:list[Path])->tuple[str,str,Path]:
+    mapping=model_profile_mapping(repo_root,codex_home); normalized=model.casefold(); profile='default'; filename=mapping.get('default',DEFAULT_MODEL_PROFILE_FILES['default'])
+    patterns=sorted((key for key in mapping if key.casefold()!='default'),key=len,reverse=True)
+    for pattern in patterns:
+        lowered=pattern.casefold()
+        if fnmatchcase(normalized,lowered) or (not any(char in lowered for char in '*?[') and normalized.startswith(lowered)):
+            profile=pattern; filename=mapping[pattern]; break
+    safe_filename,prompt_path=resolve_profile_path(repo_root,codex_home,filename,owned_targets)
+    if not prompt_path.is_file(): profile='default'; safe_filename,prompt_path=resolve_profile_path(repo_root,codex_home,mapping.get('default',DEFAULT_MODEL_PROFILE_FILES['default']),owned_targets)
+    if not prompt_path.is_file(): safe_filename,prompt_path=resolve_profile_path(repo_root,codex_home,DEFAULT_MODEL_PROFILE_FILES['default'],owned_targets)
+    if not prompt_path.is_file(): raise FileNotFoundError(f'model prompt profile not found: {prompt_path}')
+    return profile,safe_filename,prompt_path
+def _managed_config_value(metadata:dict,path:list[str])->object:
+    config_merge=metadata.get('config_merge') if isinstance(metadata,dict) else None
+    if not isinstance(config_merge,dict): return _MISSING
+    for entry in config_merge.get('added_values',[]):
+        if isinstance(entry,dict) and entry.get('path')==path: return entry.get('value')
+    return _MISSING
+def original_model_instructions_reference(codex_home:Path,ownership_data:dict)->str|None:
+    config_path=codex_home/'config.toml'; current=_config_string(config_path,'model_instructions_file')
+    previous_system=ownership_data.get('system_prompt') if isinstance(ownership_data,dict) else None
+    previous_reference=previous_system.get('user_model_instructions_file') if isinstance(previous_system,dict) else None
+    if current:
+        managed=_managed_config_value(ownership_data,['model_instructions_file'])
+        if current==SYSTEM_INSTRUCTIONS_CONFIG_VALUE: return previous_reference if isinstance(previous_reference,str) and previous_reference.strip() else None
+        if managed is not _MISSING and current==managed: return None
+        return current
+    return previous_reference if isinstance(previous_reference,str) and previous_reference.strip() else None
+def resolve_instruction_reference(config_path:Path,reference:str|None)->Path|None:
+    if not reference: return None
+    candidate=Path(reference).expanduser()
+    if not candidate.is_absolute(): candidate=config_path.parent/candidate
+    return candidate.resolve(strict=False)
+def _sha256_text(value:str)->str:
+    return hashlib.sha256(value.encode('utf-8')).hexdigest() if value else ''
+def build_model_profile_catalog(repo_root:Path,codex_home:Path,owned_targets:list[Path])->tuple[str,list[dict]]:
+    entries=[]; sections=[]
+    for pattern,configured_filename in model_profile_mapping(repo_root,codex_home).items():
+        filename,prompt_path=resolve_profile_path(repo_root,codex_home,configured_filename,owned_targets)
+        if not prompt_path.is_file(): continue
+        profile_content=prompt_path.read_text(encoding='utf-8-sig').strip(); entries.append({'profile':pattern,'profile_file':filename,'profile_sha256':_sha256_text(profile_content)})
+        sections.append(f'## Model system profile: {pattern}\n\nProfile file: `{filename}`\n\n{profile_content}')
+    if not sections: raise FileNotFoundError('no model prompt profiles available for system catalog')
+    routes='\n'.join(f'- `{entry["profile"]}` -> `{entry["profile_file"]}`' for entry in entries)
+    router=(
+        '# Automatic model system profile router\n\n'
+        'At every new conversation, read the `[model-prompt-profile]` metadata emitted by SessionStart. '
+        'Activate exactly the one model profile section whose pattern/file matches that metadata. '
+        'Treat every non-matching model profile section as inert reference data and do not follow it. '
+        'If metadata is absent, match the runtime model identifier against the patterns below; use `default` only when no specialized pattern matches.\n\n'
+        f'{routes}\n\n{MODEL_CATALOG_START}\n'+'\n\n'.join(sections)+f'\n{MODEL_CATALOG_END}'
+    )
+    return router,entries
+def build_system_instructions(repo_root:Path,codex_home:Path,model:str,model_source:str,user_reference:str|None,owned_targets:list[Path])->tuple[str,dict]:
+    profile,filename,profile_path=select_model_profile(repo_root,codex_home,model,owned_targets)
+    base_path=repo_root/'instruction.ctf.md'; generated_path=codex_home/'redteam-mode'/'system-instructions.md'; user_path=resolve_instruction_reference(codex_home/'config.toml',user_reference)
+    user_content=''
+    if user_path is not None and user_path not in {base_path.resolve(strict=False),generated_path.resolve(strict=False)}:
+        try: user_content=user_path.read_text(encoding='utf-8-sig').strip()
+        except OSError as exc: warn(f'user model instructions not loaded from {user_path}: {exc}')
+    base_content=base_path.read_text(encoding='utf-8-sig').strip(); profile_content=profile_path.read_text(encoding='utf-8-sig').strip(); profile_catalog,catalog_entries=build_model_profile_catalog(repo_root,codex_home,owned_targets)
+    metadata={'model':model,'model_source':model_source,'profile':profile,'profile_file':filename,'layer':'system','delivery':'model_instructions_file:app-dispatcher','generated_path':str(generated_path.resolve(strict=False)),'user_model_instructions_file':user_reference,'user_instructions_path':str(user_path) if user_path is not None else None,'user_instructions_sha256':_sha256_text(user_content),'base_instructions_sha256':_sha256_text(base_content),'profile_sha256':_sha256_text(profile_content),'profile_catalog':catalog_entries}
+    sections=[]
+    if user_content: sections.append(f'# Preserved user system instructions\n\n{user_content}')
+    sections.extend((f'# Codex red-team base instructions\n\n{base_content}',profile_catalog))
+    marker=json.dumps(metadata,ensure_ascii=False,separators=(',',':')); content=f'{SYSTEM_PROFILE_START}\n{marker}\n{SYSTEM_PROFILE_END}\n\n'+'\n\n'.join(sections)+'\n'
+    metadata['combined_sha256']=_sha256_text(content)
+    return content,metadata
+def write_system_instructions(destination:Path,content:str,dry_run:bool)->None:
+    info(f'write combined system instructions -> {destination}')
+    if dry_run: return
+    destination.parent.mkdir(parents=True,exist_ok=True); temporary=destination.with_name(f'{destination.name}.tmp'); temporary.write_text(content,encoding='utf-8'); os.replace(temporary,destination)
+def write_launcher_scripts(codex_home:Path,dry_run:bool)->None:
+    launcher_dir=codex_home/'redteam-mode'; windows_path=launcher_dir/'codex-redteam.cmd'; posix_path=launcher_dir/'codex-redteam'
+    info(f'write model-aware launchers -> {windows_path}, {posix_path}')
+    if dry_run: return
+    launcher_dir.mkdir(parents=True,exist_ok=True); python_cmd=str(Path(sys.executable).resolve(strict=False))
+    windows_path.write_text(f'@echo off\r\n"{python_cmd}" -B "%~dp0launcher.py" %*\r\n',encoding='utf-8')
+    posix_path.write_text(f'#!/bin/sh\nexec {shlex.quote(python_cmd)} -B "$(dirname "$0")/launcher.py" "$@"\n',encoding='utf-8')
+    posix_path.chmod(posix_path.stat().st_mode|0o111)
 def _collect_toml_ownership(value:object,path:tuple[str,...],added_values:list[dict],added_tables:list[list[str]])->None:
     if _toml_container(value):
         added_tables.append(list(path))
@@ -118,11 +235,21 @@ def _dedupe_owned_tables(entries:list[list[str]])->list[list[str]]:
         key=tuple(path)
         if key not in seen: seen.add(key); deduped.append(path)
     return deduped
-def prepare_config_merge(src:Path,dst:Path,previous_config_merge:object=None)->tuple[Path,str,str,dict]:
+def _dedupe_replaced_values(entries:list[dict])->list[dict]:
+    deduped={}
+    for entry in entries:
+        path=entry.get('path') if isinstance(entry,dict) else None
+        if isinstance(path,list) and path and all(isinstance(key,str) for key in path): deduped[tuple(path)]={'path':path,'value':entry.get('value'),'previous_value':entry.get('previous_value')}
+    return list(deduped.values())
+def _set_toml_value(container:object,path:list[str],value:object)->None:
+    parent=container
+    for key in path[:-1]: parent=parent[key]
+    parent[path[-1]]=value
+def prepare_config_merge(src:Path,dst:Path,previous_config_merge:object=None,forced_values:dict[tuple[str,...],object]|None=None)->tuple[Path,str,str,dict]:
     template_text=src.read_text(encoding='utf-8-sig')
     existing_text=dst.read_text(encoding='utf-8-sig') if dst.exists() else ''
     template=tomlkit.parse(template_text); existing=tomlkit.parse(existing_text) if existing_text.strip() else tomlkit.document()
-    previous=_valid_config_merge(previous_config_merge,dst); retained_values=[]; retained_tables=[]
+    previous=_valid_config_merge(previous_config_merge,dst); retained_values=[]; retained_tables=[]; previous_replaced={}
     for entry in previous.get('added_values',[]):
         path=entry.get('path') if isinstance(entry,dict) else None
         current=_toml_value_at(existing,path) if isinstance(path,list) and path and all(isinstance(key,str) for key in path) else _MISSING
@@ -130,10 +257,23 @@ def prepare_config_merge(src:Path,dst:Path,previous_config_merge:object=None)->t
     for path in previous.get('added_tables',[]):
         current=_toml_value_at(existing,path) if isinstance(path,list) and path and all(isinstance(key,str) for key in path) else _MISSING
         if current is not _MISSING and _toml_container(current): retained_tables.append(path)
+    for entry in previous.get('replaced_values',[]):
+        path=entry.get('path') if isinstance(entry,dict) else None
+        if isinstance(path,list) and path and all(isinstance(key,str) for key in path): previous_replaced[tuple(path)]=entry
     added_values=[]; added_tables=[]; changed=_merge_toml_missing(template,existing,(),added_values,added_tables)
+    replaced_values=[]
+    for path_tuple,managed_value in (forced_values or {}).items():
+        path=list(path_tuple); current=_toml_value_at(existing,path); previous_entry=previous_replaced.get(path_tuple)
+        if current is _MISSING:
+            _set_toml_value(existing,path,managed_value); added_values.append({'path':path,'value':managed_value}); changed=True; continue
+        current_plain=_toml_plain(current)
+        if current_plain!=managed_value:
+            previous_value=previous_entry.get('previous_value') if isinstance(previous_entry,dict) and current_plain==previous_entry.get('value') else current_plain
+            _set_toml_value(existing,path,managed_value); replaced_values.append({'path':path,'value':managed_value,'previous_value':previous_value}); changed=True
+        elif isinstance(previous_entry,dict): replaced_values.append(previous_entry)
     merged=tomlkit.dumps(existing) if changed else existing_text
     existed_before=previous.get('existed_before') if isinstance(previous.get('existed_before'),bool) else dst.exists()
-    metadata={'path':str(dst.resolve(strict=False)),'existed_before':existed_before,'added_values':_dedupe_owned_values(retained_values+added_values),'added_tables':_dedupe_owned_tables(retained_tables+added_tables)}
+    metadata={'path':str(dst.resolve(strict=False)),'existed_before':existed_before,'added_values':_dedupe_owned_values(retained_values+added_values),'added_tables':_dedupe_owned_tables(retained_tables+added_tables),'replaced_values':_dedupe_replaced_values(replaced_values)}
     return dst,existing_text,merged,metadata
 def backup_config_file(dst:Path,dry_run:bool)->Path:
     backup=dst.with_name(f'{dst.name}.{datetime.now().strftime("%Y%m%d%H%M%S")}.bak')
@@ -156,18 +296,29 @@ def _remove_toml_path(container:object,path:list[str])->bool:
         parent=parent[key]
     if not _toml_container(parent) or path[-1] not in parent: return False
     del parent[path[-1]]; return True
-def _config_references_instruction(document:object,config_path:Path,instruction_path:Path)->bool:
+def _configured_instruction_path(document:object,config_path:Path)->Path|None:
     value=_toml_value_at(document,['model_instructions_file'])
-    if value is _MISSING or not isinstance(_toml_plain(value),str): return False
+    if value is _MISSING or not isinstance(_toml_plain(value),str): return None
     candidate=Path(_toml_plain(value)).expanduser()
     if not candidate.is_absolute(): candidate=config_path.parent/candidate
-    try: return candidate.resolve(strict=False)==instruction_path.resolve(strict=False)
-    except OSError: return False
+    try: return candidate.resolve(strict=False)
+    except OSError: return None
+def _config_references_instruction(document:object,config_path:Path,instruction_paths:list[Path])->bool:
+    candidate=_configured_instruction_path(document,config_path)
+    return candidate is not None and candidate in {path.resolve(strict=False) for path in instruction_paths}
 def prepare_config_removal(codex_home:Path,manifest_data:dict)->tuple[Path,str,str|None,bool]:
-    dst=codex_home/'config.toml'; instruction=codex_home/'instruction.ctf.md'
+    dst=codex_home/'config.toml'; instructions=[codex_home/'redteam-mode'/'system-instructions.md',codex_home/'instruction.ctf.md']
     if not dst.exists(): return dst,'',None,False
     existing_text=dst.read_text(encoding='utf-8-sig'); document=tomlkit.parse(existing_text) if existing_text.strip() else tomlkit.document()
     metadata=_valid_config_merge(manifest_data.get('config_merge'),dst); changed=False
+    for entry in metadata.get('replaced_values',[]):
+        path=entry.get('path') if isinstance(entry,dict) else None
+        current=_toml_value_at(document,path) if isinstance(path,list) and path and all(isinstance(key,str) for key in path) else _MISSING
+        if current is _MISSING: continue
+        if _toml_plain(current)!=entry.get('value'):
+            warn(f"preserve user-modified config key {'.'.join(path)}")
+            continue
+        _set_toml_value(document,path,entry.get('previous_value')); changed=True
     for entry in metadata.get('added_values',[]):
         path=entry.get('path') if isinstance(entry,dict) else None
         current=_toml_value_at(document,path) if isinstance(path,list) and path and all(isinstance(key,str) for key in path) else _MISSING
@@ -182,7 +333,7 @@ def prepare_config_removal(codex_home:Path,manifest_data:dict)->tuple[Path,str,s
         if current is not _MISSING and _toml_container(current) and not list(current.items()): changed=_remove_toml_path(document,path) or changed
     rendered=tomlkit.dumps(document) if changed else existing_text
     if changed and not metadata.get('existed_before',True) and not list(document.items()) and not rendered.strip(): rendered=None
-    return dst,existing_text,rendered,_config_references_instruction(document,dst,instruction)
+    return dst,existing_text,rendered,_config_references_instruction(document,dst,instructions)
 def apply_config_removal(plan:tuple[Path,str,str|None,bool],dry_run:bool)->None:
     dst,existing_text,rendered,_=plan
     if rendered==existing_text: return
@@ -329,7 +480,7 @@ def run_validate(repo_root:Path,codex_home:Path,dry_run:bool,manifest_candidate:
 def repo_skill_dirs(repo_root:Path)->list[Path]:
     skills_root=repo_root/'agents'/'skills'; return sorted(path for path in skills_root.iterdir() if path.is_dir()) if skills_root.exists() else []
 def managed_targets(repo_root:Path,codex_home:Path,agents_home:Path)->list[Path]:
-    targets=[codex_home/'instruction.ctf.md',codex_home/'hooks'/'session-start-context.py',codex_home/'hooks'/'hook-security-context-hook.py',codex_home/'hooks'/'redteam_state.py',codex_home/'hooks'/'core',codex_home/'router',codex_home/'orchestrator',codex_home/'automation',codex_home/'session_patcher']
+    targets=[codex_home/'redteam-mode'/'system-instructions.md',codex_home/'redteam-mode'/'launcher.py',codex_home/'redteam-mode'/'codex-redteam.cmd',codex_home/'redteam-mode'/'codex-redteam',codex_home/'hooks'/'session-start-context.py',codex_home/'hooks'/'hook-security-context-hook.py',codex_home/'hooks'/'redteam_state.py',codex_home/'hooks'/'core',codex_home/'router',codex_home/'orchestrator',codex_home/'automation',codex_home/'session_patcher']
     targets.extend(agents_home/'skills'/skill_dir.name for skill_dir in repo_skill_dirs(repo_root)); return targets
 def legacy_cleanup_targets(codex_home:Path,agents_home:Path)->list[Path]:
     return [codex_home/'hooks'/'legacy-redteam-hook.py', agents_home/'skills'/'red-team-command-doctrine-old']
@@ -373,10 +524,12 @@ def load_manifest_targets(codex_home:Path)->list[Path]:
     manifest=manifest_path(codex_home); data=load_manifest_data(codex_home)
     if not data: return []
     return _validated_absolute_paths(data['managed_paths'],manifest,'install manifest')
-def build_manifest_payload(codex_home:Path,agents_file:Path,agents_home:Path,targets:list[Path],log_root:Path,custom_skill_dirs_enabled:bool,config_merge:dict|None=None)->dict:
+def build_manifest_payload(codex_home:Path,agents_file:Path,agents_home:Path,targets:list[Path],log_root:Path,custom_skill_dirs_enabled:bool,config_merge:dict|None=None,system_prompt:dict|None=None)->dict:
     skills_root=agents_home/'skills'
     skill_dirs=[str(skills_root/path.name) for path in repo_skill_dirs(Path(__file__).resolve().parents[1])]
-    return {'name':APP_NAME,'version':APP_VERSION,'manifest_schema_version':2,'installed_at':datetime.now().isoformat(timespec='seconds'),'managed_paths':[str(path) for path in targets],'merged_files':[str(agents_file),str(codex_home/'hooks.json'),str(codex_home/'config.toml')],'skills_paths':{'skills_root':str(skills_root),'skill_dirs':skill_dirs},'custom_skill_dirs_enabled':bool(custom_skill_dirs_enabled),'log_root':str(log_root),'config_merge':config_merge or {'path':str((codex_home/'config.toml').resolve(strict=False)),'existed_before':True,'added_values':[],'added_tables':[]}}
+    payload={'name':APP_NAME,'version':APP_VERSION,'manifest_schema_version':2,'installed_at':datetime.now().isoformat(timespec='seconds'),'managed_paths':[str(path) for path in targets],'merged_files':[str(agents_file),str(codex_home/'hooks.json'),str(codex_home/'config.toml')],'skills_paths':{'skills_root':str(skills_root),'skill_dirs':skill_dirs},'custom_skill_dirs_enabled':bool(custom_skill_dirs_enabled),'log_root':str(log_root),'config_merge':config_merge or {'path':str((codex_home/'config.toml').resolve(strict=False)),'existed_before':True,'added_values':[],'added_tables':[]}}
+    if system_prompt: payload['system_prompt']=dict(system_prompt)
+    return payload
 def atomic_write_json(path:Path,payload:dict)->None:
     temporary=path.with_name(f'{path.name}.tmp')
     path.parent.mkdir(parents=True,exist_ok=True)
@@ -436,8 +589,8 @@ def prepare_manifest_payload(codex_home:Path,payload:dict,dry_run:bool)->tuple[P
     if dry_run: return None
     manifest.parent.mkdir(parents=True,exist_ok=True); candidate.write_text(json.dumps(payload,ensure_ascii=False,indent=2),encoding='utf-8')
     return manifest,candidate
-def prepare_manifest(codex_home:Path,agents_file:Path,agents_home:Path,targets:list[Path],log_root:Path,custom_skill_dirs_enabled:bool,dry_run:bool,config_merge:dict|None=None)->tuple[Path,Path]|None:
-    payload=build_manifest_payload(codex_home,agents_file,agents_home,targets,log_root,custom_skill_dirs_enabled,config_merge)
+def prepare_manifest(codex_home:Path,agents_file:Path,agents_home:Path,targets:list[Path],log_root:Path,custom_skill_dirs_enabled:bool,dry_run:bool,config_merge:dict|None=None,system_prompt:dict|None=None)->tuple[Path,Path]|None:
+    payload=build_manifest_payload(codex_home,agents_file,agents_home,targets,log_root,custom_skill_dirs_enabled,config_merge,system_prompt)
     return prepare_manifest_payload(codex_home,payload,dry_run)
 def commit_manifest(plan:tuple[Path,Path]|None,dry_run:bool)->None:
     if dry_run or plan is None: return
@@ -446,8 +599,8 @@ def discard_manifest(plan:tuple[Path,Path]|None)->None:
     if plan is None: return
     candidate=plan[1]
     if candidate.exists(): candidate.unlink()
-def write_manifest(codex_home:Path,agents_file:Path,agents_home:Path,targets:list[Path],log_root:Path,custom_skill_dirs_enabled:bool,dry_run:bool,config_merge:dict|None=None)->None:
-    plan=prepare_manifest(codex_home,agents_file,agents_home,targets,log_root,custom_skill_dirs_enabled,dry_run,config_merge); commit_manifest(plan,dry_run)
+def write_manifest(codex_home:Path,agents_file:Path,agents_home:Path,targets:list[Path],log_root:Path,custom_skill_dirs_enabled:bool,dry_run:bool,config_merge:dict|None=None,system_prompt:dict|None=None)->None:
+    plan=prepare_manifest(codex_home,agents_file,agents_home,targets,log_root,custom_skill_dirs_enabled,dry_run,config_merge,system_prompt); commit_manifest(plan,dry_run)
 def prepare_upgrade_cleanup(codex_home:Path,agents_home:Path,agents_file:Path,default_targets:list[Path],pending_targets:list[Path]|None=None)->list[Path]:
     previous_targets=load_manifest_targets(codex_home); recorded_targets=_unique_cleanup_targets(previous_targets + list(pending_targets or [])); cleanup_targets=recorded_targets or default_targets; protected={str(agents_file), str(codex_home/'AGENTS.md'), str(codex_home/'hooks.json'), str(codex_home/'config.toml')}
     cleanup_targets=_unique_cleanup_targets(cleanup_targets + legacy_cleanup_targets(codex_home,agents_home),protected)
@@ -462,10 +615,12 @@ def uninstall(repo_root:Path,codex_home:Path,agents_home:Path,agents_file:Path,d
     config_plan=prepare_config_removal(codex_home,ownership_data or manifest_data)
     hooks_plan=prepare_hooks_removal(codex_home)
     recorded_targets=_unique_cleanup_targets(load_manifest_targets(codex_home) + transaction_targets(codex_home)); targets=_unique_cleanup_targets((recorded_targets or managed_targets(repo_root,codex_home,agents_home)) + legacy_cleanup_targets(codex_home,agents_home))
-    instruction=(codex_home/'instruction.ctf.md').resolve(strict=False)
     if config_plan[3]:
-        targets=[target for target in targets if target.resolve(strict=False)!=instruction]
-        warn(f'preserve {instruction} because config.toml still references it')
+        rendered=config_plan[2] or ''
+        referenced=_configured_instruction_path(tomlkit.parse(rendered) if rendered.strip() else tomlkit.document(),config_plan[0])
+        if referenced is not None:
+            targets=[target for target in targets if target.resolve(strict=False)!=referenced]
+            warn(f'preserve managed instruction file because config.toml still references it: {referenced}')
     preflight_cleanup_targets(targets,'uninstall')
     info(f'apply managed config removal -> {config_plan[0]}'); apply_config_removal(config_plan,dry_run)
     for target in targets: remove_path(target,dry_run)
@@ -473,7 +628,7 @@ def uninstall(repo_root:Path,codex_home:Path,agents_home:Path,agents_file:Path,d
     if agents_file != codex_home/'AGENTS.md': remove_agents_block(codex_home/'AGENTS.md',dry_run)
     info(f'apply managed hook removal -> {hooks_plan[0]}'); apply_hooks_plan(hooks_plan,dry_run); remove_path(manifest_path(codex_home),dry_run); remove_transaction(codex_home,dry_run)
 def main()->None:
-    parser=argparse.ArgumentParser(description='Install codex-redteam-optin-mode into a Codex Home or project.'); parser.add_argument('--codex-home', help='Codex Home/profile directory. AGENTS.md here is global guidance; use --project-home for project AGENTS.md.'); parser.add_argument('--agents-home', help='Skill installation destination. For a custom runtime directory, also use --enable-custom-skill-dirs.'); parser.add_argument('--project-home', help='Project root. Installs Codex files under PATH/.codex, skills under PATH/.agents by default, and AGENTS.md at PATH/AGENTS.md.'); parser.add_argument('--log-root', help='Automation log root recorded in the install manifest.'); parser.add_argument('--enable-custom-skill-dirs', action='store_true', help='Prioritize the manifest-recorded custom skill directory at runtime.'); parser.add_argument('--dry-run', action='store_true', help='Preview operations without writing files.'); parser.add_argument('--uninstall', action='store_true', help='Remove managed files, hooks, and AGENTS.md blocks.'); args=parser.parse_args()
+    parser=argparse.ArgumentParser(description='Install codex-redteam-optin-mode into a Codex Home or project.'); parser.add_argument('--codex-home', help='Codex Home/profile directory. AGENTS.md here is global guidance; use --project-home for project AGENTS.md.'); parser.add_argument('--agents-home', help='Skill installation destination. For a custom runtime directory, also use --enable-custom-skill-dirs.'); parser.add_argument('--project-home', help='Project root. Installs Codex files under PATH/.codex, skills under PATH/.agents by default, and AGENTS.md at PATH/AGENTS.md.'); parser.add_argument('--log-root', help='Automation log root recorded in the install manifest.'); parser.add_argument('--model', help='Active model used to select the system-layer Jailbreak profile. Falls back to CODEX_MODEL, target config, previous manifest, then source config.'); parser.add_argument('--enable-custom-skill-dirs', action='store_true', help='Prioritize the manifest-recorded custom skill directory at runtime.'); parser.add_argument('--dry-run', action='store_true', help='Preview operations without writing files.'); parser.add_argument('--uninstall', action='store_true', help='Remove managed files, hooks, and AGENTS.md blocks.'); args=parser.parse_args()
     if args.project_home and args.codex_home: parser.error('--project-home cannot be combined with --codex-home')
     repo_root=Path(__file__).resolve().parents[1]; codex_home,agents_home,agents_file=resolve_install_paths(args.project_home,args.codex_home,args.agents_home)
     log_root=resolve_log_root(codex_home,args.log_root)
@@ -492,18 +647,20 @@ def main()->None:
         good('uninstall complete'); return
     info(f"preflight config merge {repo_root/'config.toml'} -> {codex_home/'config.toml'}")
     previous_manifest=load_manifest_data(codex_home); pending_data=load_transaction_data(codex_home); ownership_data=pending_data.get('candidate_manifest') if pending_data else previous_manifest
-    config_plan=prepare_config_merge(repo_root/'config.toml', codex_home/'config.toml',ownership_data.get('config_merge') if ownership_data else None)
+    user_reference=original_model_instructions_reference(codex_home,ownership_data or {}); system_model,system_model_source=resolve_install_model(repo_root,codex_home,args.model,ownership_data.get('system_prompt') if ownership_data else None)
+    config_plan=prepare_config_merge(repo_root/'config.toml', codex_home/'config.toml',ownership_data.get('config_merge') if ownership_data else None,{('model_instructions_file',):SYSTEM_INSTRUCTIONS_CONFIG_VALUE})
     hooks_plan=prepare_hooks_merge(repo_root,codex_home)
     pending_targets=transaction_targets(codex_home); previous_targets=_unique_cleanup_targets(load_manifest_targets(codex_home)+pending_targets)
+    system_instructions,system_prompt=build_system_instructions(repo_root,codex_home,system_model,system_model_source,user_reference,previous_targets); info(f"system prompt: model={system_model}; profile={system_prompt['profile']}; file={system_prompt['profile_file']}; user_base={user_reference or 'none'}")
     current_targets.extend(managed_prompt_targets(repo_root,codex_home,previous_targets))
     cleanup_targets=prepare_upgrade_cleanup(codex_home,agents_home,agents_file,current_targets,pending_targets)
-    candidate_manifest=build_manifest_payload(codex_home,agents_file,agents_home,current_targets,log_root,args.enable_custom_skill_dirs,config_plan[3])
+    candidate_manifest=build_manifest_payload(codex_home,agents_file,agents_home,current_targets,log_root,args.enable_custom_skill_dirs,config_plan[3],system_prompt)
     begin_transaction(codex_home,agents_home,previous_manifest,candidate_manifest,previous_targets,current_targets,args.dry_run)
     manifest_plan=None; deployed=False
     try:
         apply_upgrade_cleanup(cleanup_targets,args.dry_run)
         if agents_file != codex_home/'AGENTS.md': remove_agents_block(codex_home/'AGENTS.md',args.dry_run)
-        copy_file(repo_root/'instruction.ctf.md', codex_home/'instruction.ctf.md', args.dry_run); info(f"merge {repo_root/'config.toml'} -> {codex_home/'config.toml'}"); apply_config_merge(config_plan,args.dry_run); seed_prompt_files(repo_root,codex_home,args.dry_run); upsert_agents_file(repo_root,agents_file,args.dry_run)
+        write_system_instructions(codex_home/'redteam-mode'/'system-instructions.md',system_instructions,args.dry_run); copy_file(repo_root/'codex'/'launcher.py',codex_home/'redteam-mode'/'launcher.py',args.dry_run); write_launcher_scripts(codex_home,args.dry_run); info(f"merge {repo_root/'config.toml'} -> {codex_home/'config.toml'}"); apply_config_merge(config_plan,args.dry_run); seed_prompt_files(repo_root,codex_home,args.dry_run); upsert_agents_file(repo_root,agents_file,args.dry_run)
         copy_file(repo_root/'codex'/'hooks'/'session-start-context.py', codex_home/'hooks'/'session-start-context.py', args.dry_run)
         copy_file(repo_root/'codex'/'hooks'/'hook-security-context-hook.py', codex_home/'hooks'/'hook-security-context-hook.py', args.dry_run)
         copy_file(repo_root/'codex'/'hooks'/'redteam_state.py', codex_home/'hooks'/'redteam_state.py', args.dry_run)

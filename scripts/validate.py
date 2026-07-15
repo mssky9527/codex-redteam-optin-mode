@@ -9,7 +9,9 @@ is functional.
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
+import re
 import sys
 import tomllib
 from pathlib import Path
@@ -24,6 +26,9 @@ def configure_stdio() -> None:
 
 
 REQUIRED_CODEX_FILES = [
+    "redteam-mode/launcher.py",
+    "redteam-mode/codex-redteam.cmd",
+    "redteam-mode/codex-redteam",
     "hooks/session-start-context.py",
     "hooks/hook-security-context-hook.py",
     "hooks/redteam_state.py",
@@ -78,9 +83,13 @@ REQUIRED_CODEX_FILES = [
 ]
 
 REQUIRED_ROOT_FILES = [
-    "instruction.ctf.md",
     "config.toml",
 ]
+
+SYSTEM_PROFILE_START = "<!-- codex-redteam-system-profile:start -->"
+SYSTEM_PROFILE_END = "<!-- codex-redteam-system-profile:end -->"
+MODEL_CATALOG_START = "<!-- codex-redteam-model-profiles:start -->"
+MODEL_CATALOG_END = "<!-- codex-redteam-model-profiles:end -->"
 
 OPTIONAL_CODEX_FILES = [
     "prompts/Reverse.md",
@@ -120,6 +129,87 @@ def check_skill_metadata(skill_md: Path, expected_name: str) -> Tuple[bool, str]
     if not meta.get("description"):
         return False, f"  FAIL {expected_name}/SKILL.md missing description"
     return True, f"  OK  {expected_name}/SKILL.md metadata"
+
+
+def _load_manifest_data(repo_root: Path, manifest_override: Path | None) -> dict:
+    manifest = manifest_override or repo_root / "redteam-install-manifest.json"
+    if not manifest.is_file():
+        return {}
+    try:
+        value = json.loads(manifest.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, OSError):
+        return {}
+    return value if isinstance(value, dict) else {}
+
+
+def check_system_prompt(repo_root: Path, codex_root: Path, manifest_override: Path | None) -> Tuple[bool, str]:
+    config_path = repo_root / "config.toml"
+    system_path = repo_root / "redteam-mode" / "system-instructions.md"
+    try:
+        config = tomllib.loads(config_path.read_text(encoding="utf-8-sig"))
+    except (OSError, tomllib.TOMLDecodeError) as exc:
+        return False, f"system prompt: config unreadable - {exc}"
+    reference = config.get("model_instructions_file")
+    if not isinstance(reference, str) or not reference.strip():
+        return False, "system prompt: model_instructions_file missing"
+    configured_path = Path(reference).expanduser()
+    if not configured_path.is_absolute():
+        configured_path = config_path.parent / configured_path
+    if configured_path.resolve(strict=False) != system_path.resolve(strict=False):
+        return False, f"system prompt: config points to {configured_path.resolve(strict=False)}"
+    try:
+        content = system_path.read_text(encoding="utf-8-sig")
+    except OSError as exc:
+        return False, f"system prompt: generated file unreadable - {exc}"
+    pattern = re.escape(SYSTEM_PROFILE_START) + r"\s*(\{.*?\})\s*" + re.escape(SYSTEM_PROFILE_END)
+    match = re.search(pattern, content, re.DOTALL)
+    if match is None:
+        return False, "system prompt: profile marker missing"
+    try:
+        metadata = json.loads(match.group(1))
+    except json.JSONDecodeError as exc:
+        return False, f"system prompt: invalid profile marker - {exc}"
+    if not isinstance(metadata, dict) or metadata.get("layer") != "system":
+        return False, "system prompt: profile marker is not system-layer"
+    filename = metadata.get("profile_file") if isinstance(metadata, dict) else None
+    if not isinstance(filename, str) or Path(filename).name != filename:
+        return False, "system prompt: invalid profile filename"
+    profile_path = codex_root / "prompts" / filename
+    try:
+        profile_content = profile_path.read_text(encoding="utf-8-sig").strip()
+    except OSError as exc:
+        return False, f"system prompt: profile unreadable - {exc}"
+    if not profile_content or profile_content not in content:
+        return False, f"system prompt: full profile content missing for {filename}"
+    catalog = metadata.get("profile_catalog")
+    if not isinstance(catalog, list) or not catalog:
+        return False, "system prompt: model profile catalog metadata missing"
+    for entry in catalog:
+        catalog_filename = entry.get("profile_file") if isinstance(entry, dict) else None
+        if not isinstance(catalog_filename, str) or Path(catalog_filename).name != catalog_filename:
+            return False, "system prompt: invalid catalog profile filename"
+        try:
+            catalog_content = (codex_root / "prompts" / catalog_filename).read_text(encoding="utf-8-sig").strip()
+        except OSError as exc:
+            return False, f"system prompt: catalog profile unreadable - {exc}"
+        if not catalog_content or catalog_content not in content:
+            return False, f"system prompt: catalog profile content missing for {catalog_filename}"
+    required_sections = (
+        "# Codex red-team base instructions",
+        "# Automatic model system profile router",
+        MODEL_CATALOG_START,
+        MODEL_CATALOG_END,
+    )
+    if not all(section in content for section in required_sections):
+        return False, "system prompt: required composed sections missing"
+    manifest_system = _load_manifest_data(repo_root, manifest_override).get("system_prompt")
+    if isinstance(manifest_system, dict):
+        digest = hashlib.sha256(content.encode("utf-8")).hexdigest()
+        if manifest_system.get("combined_sha256") != digest:
+            return False, "system prompt: combined SHA256 mismatch"
+        if manifest_system.get("profile_file") != filename or manifest_system.get("layer") != "system":
+            return False, "system prompt: manifest metadata mismatch"
+    return True, f"system prompt: valid ({metadata.get('profile')} -> {filename}, layer=system)"
 
 
 def _codex_root(codex_home: Path) -> Path:
@@ -219,8 +309,15 @@ def validate_install(codex_home: Path, manifest_override: Path | None = None) ->
         messages.append(msg)
         if not ok:
             all_ok = False
-    for rel in REQUIRED_ROOT_FILES:
+    root_files = ["instruction.ctf.md", *REQUIRED_ROOT_FILES] if source_tree_mode else REQUIRED_ROOT_FILES
+    for rel in root_files:
         ok, msg = check_file(repo_root, rel)
+        messages.append(msg)
+        if not ok:
+            all_ok = False
+
+    if not source_tree_mode:
+        ok, msg = check_system_prompt(repo_root, codex_root, manifest_override)
         messages.append(msg)
         if not ok:
             all_ok = False
