@@ -224,33 +224,6 @@ default = "Jailbreak.default.md"
 
 Profile files live under `$CODEX_HOME/prompts/`. Model keys support glob patterns; an unmatched model or missing specialized file falls back to `default`. App and ordinary CLI sessions use the system catalog plus `SessionStart` metadata; the `codex-redteam` CLI launcher selects one profile before process startup. Both approaches use a new conversation as the model-switch boundary.
 
-## Working Flow
-
-When red-team mode is enabled, the runtime follows this mainline:
-
-```
-phase → router → pack → leaf
-```
-
-1. **Phase detection** — rule-first matching against task intent; semantic fallback when ambiguous
-2. **Router** — maps phase to the appropriate detail pack family
-3. **Pack** — loads the compact, testable skill pack for the matched domain
-4. **Leaf** — executes the concrete skill or technique
-
-`method` is a **soft hint** — it may add value for technique selection but is not the primary routing axis.
-
-Evidence-first reasoning is enforced throughout: prove one path before expanding, distinguish facts from assumptions, end with one concrete next step.
-
-## Loop Runtime
-
-The Loop Runtime follows `Observe -> Decide -> Act -> Verify -> Record -> Next`. Every loop decision carries:
-
-- `trigger`: why this loop started or changed direction
-- `feedback_gate`: the gate used to judge whether the current step is valid
-- `exit_condition`: the condition for advancing, pivoting, blocking, reporting, or refreshing context
-
-The runtime now includes decision-tree path selection, rhythm classification, artifact/tool/scope gates, retry handling, quick-card refreshes, JSONL decision recording, and an executor adapter layer. In red-team mode, automation requires explicit `mode = "active"` / `"auto"` / `"assisted"` in config.toml to enable active execution; without configuration it defaults to `plan-only`. Direct tool execution is intentionally bounded behind Tool Registry, Scope Gate, Execution Gate, and registered Executor adapters.
-
 ## Automation Tool Policy
 
 Before planning tool use, the automation layer reads the user's local MCP/tool inventory, derives required capabilities, then selects tools in this order:
