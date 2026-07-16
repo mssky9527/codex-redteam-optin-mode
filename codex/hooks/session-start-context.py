@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+import os
 import sys
 from pathlib import Path
 
@@ -56,7 +57,8 @@ def main() -> None:
     state.active_model = profile.model
     state.active_prompt_profile = profile.profile
     save_runtime_state(state, session_id=session_id)
-    model_overlay = profile.render()
+    catalog = "single-profile" if os.environ.get("CODEX_REDTEAM_PROFILE_MODE", "").casefold() == "single" else "static"
+    model_overlay = profile.render(scope="session-fallback", catalog=catalog)
     if model_overlay:
         context = f"{context}\n{model_overlay}"
 

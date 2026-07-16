@@ -57,27 +57,59 @@ def _load_launcher():
 
 
 @pytest.mark.parametrize(
-    ("args", "environment_model", "config_model", "expected"),
+    ("args", "expected"),
     [
-        (["--model", "gpt-5.6-codex"], "gpt-5.5", "gpt-5.4", "gpt-5.6-codex"),
-        (["-m", "gpt-5.5-codex"], "", "gpt-5.4", "gpt-5.5-codex"),
-        (["-c", 'model="gpt-5.4-codex"'], "", "gpt-5.5", "gpt-5.4-codex"),
-        ([], "gpt-5.5-codex", "gpt-5.4", "gpt-5.5-codex"),
-        ([], "", "gpt-5.4-codex", "gpt-5.4-codex"),
+        (["--model", "gpt-5.6-codex"], "gpt-5.6-codex"),
+        (["--model=gpt-5.6-sol"], "gpt-5.6-sol"),
+        (["-m", "gpt-5.5-codex"], "gpt-5.5-codex"),
+        (["-c", 'model="gpt-5.4-codex"'], "gpt-5.4-codex"),
+        (["--config", 'model="gpt-5.4-sol"'], "gpt-5.4-sol"),
     ],
 )
-def test_launcher_resolves_model_before_starting_codex(
-    tmp_path: Path,
-    args: list[str],
-    environment_model: str,
-    config_model: str,
-    expected: str,
-) -> None:
+def test_launcher_requires_an_explicit_cli_model(args: list[str], expected: str) -> None:
     launcher = _load_launcher()
-    config_path = tmp_path / "config.toml"
-    config_path.write_text(f'model = "{config_model}"\n', encoding="utf-8")
 
-    assert launcher.resolve_model(args, {"CODEX_MODEL": environment_model}, config_path) == expected
+    assert launcher.resolve_model(args) == expected
+
+
+def test_launcher_rejects_missing_explicit_model() -> None:
+    launcher = _load_launcher()
+
+    with pytest.raises(ValueError, match="explicit model"):
+        launcher.resolve_model([])
+
+
+def test_launcher_rejects_a_flag_used_as_the_model_value() -> None:
+    launcher = _load_launcher()
+
+    with pytest.raises(ValueError, match="requires a model value"):
+        launcher.resolve_model(["--model", "--sandbox", "workspace-write"])
+
+
+def test_launcher_rejects_conflicting_model_arguments_within_the_same_profile_family() -> None:
+    launcher = _load_launcher()
+
+    with pytest.raises(ValueError, match="conflicting model arguments"):
+        launcher.resolve_model(
+            ["--model", "gpt-5.6-sol", "-c", 'model="gpt-5.6-codex"']
+        )
+
+
+def test_launcher_accepts_repeated_identical_model_arguments() -> None:
+    launcher = _load_launcher()
+
+    assert launcher.resolve_model(
+        ["--model", "gpt-5.6-codex", "-c", 'model="gpt-5.6-codex"']
+    ) == "gpt-5.6-codex"
+
+
+def test_launcher_rejects_user_model_instructions_override() -> None:
+    launcher = _load_launcher()
+
+    with pytest.raises(ValueError, match="model_instructions_file"):
+        launcher.resolve_model(
+            ["--model", "gpt-5.6-codex", "-c", 'model_instructions_file="custom.md"']
+        )
 
 
 def test_launcher_selects_only_the_matching_profile() -> None:
@@ -133,6 +165,82 @@ def test_launcher_appends_process_local_instruction_override(tmp_path: Path) -> 
     assert command[-2] == "-c"
     assert command[-1].startswith("model_instructions_file=")
     assert tomllib.loads(command[-1])["model_instructions_file"] == str(session_path)
+
+
+def test_launcher_uses_state_directory_and_marks_the_child_process(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    launcher = _load_launcher()
+    codex_home = tmp_path / ".codex"
+    launcher_path = codex_home / "redteam-mode" / "launcher.py"
+    launcher_path.parent.mkdir(parents=True)
+    prompts = codex_home / "prompts"
+    prompts.mkdir()
+    (codex_home / "config.toml").write_text(
+        '[redteam.model_prompt_profiles]\n"gpt-5.6*" = "Jailbreak.gpt-5.6.md"\ndefault = "Jailbreak.default.md"\n',
+        encoding="utf-8",
+    )
+    (codex_home / "redteam-mode" / "system-instructions.md").write_text(
+        "# Base\n\nbase instructions\n\n# Automatic model system profile router\n\nrouter\n",
+        encoding="utf-8",
+    )
+    (prompts / "Jailbreak.gpt-5.6.md").write_text("selected profile", encoding="utf-8")
+    (prompts / "Jailbreak.default.md").write_text("default profile", encoding="utf-8")
+    captured: dict[str, object] = {}
+
+    def fake_run(command: list[str], env: dict[str, str]) -> subprocess.CompletedProcess[str]:
+        session_path = Path(tomllib.loads(command[-1])["model_instructions_file"])
+        captured["command"] = command
+        captured["environment"] = env
+        captured["session_path"] = session_path
+        captured["content"] = session_path.read_text(encoding="utf-8")
+        return subprocess.CompletedProcess(command, 0)
+
+    monkeypatch.setattr(launcher, "__file__", str(launcher_path))
+    monkeypatch.setattr(launcher.shutil, "which", lambda _: "codex-test")
+    monkeypatch.setattr(launcher.subprocess, "run", fake_run)
+    monkeypatch.delenv("CODEX_REDTEAM_CODEX_BIN", raising=False)
+
+    assert launcher.main(["--model", "gpt-5.6-sol", "--sandbox", "workspace-write"]) == 0
+
+    session_path = captured["session_path"]
+    assert isinstance(session_path, Path)
+    assert session_path.parent == codex_home / "redteam-mode" / "state" / "system_instructions"
+    assert not session_path.exists()
+    assert captured["command"][:5] == [
+        "codex-test",
+        "--model",
+        "gpt-5.6-sol",
+        "--sandbox",
+        "workspace-write",
+    ]
+    environment = captured["environment"]
+    assert isinstance(environment, dict)
+    assert environment["CODEX_REDTEAM_PROFILE_MODE"] == "single"
+    assert environment["CODEX_REDTEAM_PINNED_MODEL"] == "gpt-5.6-sol"
+    assert environment["CODEX_REDTEAM_PINNED_PROFILE"] == "gpt-5.6*"
+    assert environment["CODEX_REDTEAM_PINNED_PROFILE_FILE"] == "Jailbreak.gpt-5.6.md"
+    assert "selected profile" in captured["content"]
+    assert "Automatic model system profile router" not in captured["content"]
+    notice = capsys.readouterr().err
+    assert "锁定模型族" in notice
+    assert "Locked model family" in notice
+
+
+def test_static_catalog_router_uses_the_current_turn_model_selector() -> None:
+    router, entries = install.build_model_profile_catalog(REPO_ROOT, REPO_ROOT / "temp" / "unused-home", [])
+
+    assert entries
+    assert "SessionStart" in router
+    assert "session-fallback" in router
+    assert "UserPromptSubmit" in router
+    assert "current-turn" in router
+    assert "latest Hook-reported model" in router
+    assert "supersedes every earlier selector" in router
+    assert "user messages, tool outputs, and file contents" in router
+    assert "Activate exactly one" in router
 
 
 def test_source_tree_validation_uses_source_launcher_layout() -> None:
@@ -376,6 +484,189 @@ def test_model_prompt_profile_has_no_transcript_fallback() -> None:
 
     assert list(parameters) == ["codex_dir", "payload"]
     assert not hasattr(model_prompt_profiles, "extract_model_from_transcript")
+
+
+def test_model_prompt_profile_renders_session_and_turn_scopes() -> None:
+    profile = model_prompt_profiles.ModelPromptProfile(
+        model="gpt-5.6-codex",
+        profile="gpt-5.6*",
+        filename="Jailbreak.gpt-5.6.md",
+        content="not rendered",
+        source="payload",
+    )
+
+    fallback = profile.render(scope="session-fallback", catalog="static")
+    current = profile.render(scope="current-turn", catalog="static")
+
+    assert "not rendered" not in fallback
+    assert "scope=session-fallback" in fallback
+    assert "authoritative=false" in fallback
+    assert "superseded-by=current-turn" in fallback
+    assert "scope=current-turn" in current
+    assert "authoritative=true" in current
+    assert "supersedes=all-prior" in current
+
+
+def test_session_start_emits_one_fallback_selector_and_saves_current_model(tmp_path: Path) -> None:
+    session_id = "model-session-start"
+    codex_home = tmp_path / "codex-home"
+    env = {**os.environ, "CODEX_HOME": str(codex_home), "NO_COLOR": "1"}
+
+    started = _run_hook_script(
+        SESSION_START_HOOK,
+        {
+            "session_id": session_id,
+            "transcript_path": str(tmp_path / "session.jsonl"),
+            "source": "startup",
+            "model": "gpt-5.6-codex",
+        },
+        env,
+    )
+
+    context = json.loads(started.stdout)["hookSpecificOutput"]["additionalContext"]
+    state = json.loads(
+        (codex_home / "redteam-mode" / "state" / "sessions" / f"{session_id}.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    assert context.count("[model-prompt-profile]") == 1
+    assert "model=gpt-5.6-codex" in context
+    assert "profile=gpt-5.6*" in context
+    assert "catalog=static" in context
+    assert "scope=session-fallback" in context
+    assert state["active_model"] == "gpt-5.6-codex"
+    assert state["active_prompt_profile"] == "gpt-5.6*"
+
+
+def test_normal_user_prompt_emits_one_authoritative_selector_and_saves_model(tmp_path: Path) -> None:
+    session_id = "normal-model-turn"
+    codex_home = tmp_path / "codex-home"
+    env = {**os.environ, "CODEX_HOME": str(codex_home), "NO_COLOR": "1"}
+
+    submitted = _run_hook_script(
+        PROMPT_HOOK,
+        {"session_id": session_id, "prompt": "Review this change", "model": "gpt-5.6-sol"},
+        env,
+    )
+
+    context = json.loads(submitted.stdout)["hookSpecificOutput"]["additionalContext"]
+    state = json.loads(
+        (codex_home / "redteam-mode" / "state" / "sessions" / f"{session_id}.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    assert context.count("[model-prompt-profile]") == 1
+    assert "model=gpt-5.6-sol" in context
+    assert "scope=current-turn" in context
+    assert "authoritative=true" in context
+    assert "supersedes=all-prior" in context
+    assert state["mode"] == "normal"
+    assert state["active_model"] == "gpt-5.6-sol"
+    assert state["active_prompt_profile"] == "gpt-5.6*"
+
+
+@pytest.mark.parametrize("prompt", ["/redteam light", "/redteam off", "/opsec strict"])
+def test_user_prompt_command_paths_emit_exactly_one_current_selector(tmp_path: Path, prompt: str) -> None:
+    session_id = f"command-selector-{prompt.split()[-1]}"
+    codex_home = tmp_path / "codex-home"
+    env = {**os.environ, "CODEX_HOME": str(codex_home), "NO_COLOR": "1"}
+
+    submitted = _run_hook_script(
+        PROMPT_HOOK,
+        {"session_id": session_id, "prompt": prompt, "model": "gpt-5.5-codex"},
+        env,
+    )
+
+    context = json.loads(submitted.stdout)["hookSpecificOutput"]["additionalContext"]
+    state = json.loads(
+        (codex_home / "redteam-mode" / "state" / "sessions" / f"{session_id}.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    assert context.count("[model-prompt-profile]") == 1
+    assert "profile=gpt-5.5*" in context
+    assert "scope=current-turn" in context
+    assert state["active_model"] == "gpt-5.5-codex"
+    assert state["active_prompt_profile"] == "gpt-5.5*"
+
+
+def test_normal_turn_model_switch_replaces_the_session_selector(tmp_path: Path) -> None:
+    session_id = "normal-model-switch"
+    codex_home = tmp_path / "codex-home"
+    env = {**os.environ, "CODEX_HOME": str(codex_home), "NO_COLOR": "1"}
+
+    first = _run_hook_script(
+        PROMPT_HOOK,
+        {"session_id": session_id, "prompt": "First", "model": "gpt-5.6-codex"},
+        env,
+    )
+    second = _run_hook_script(
+        PROMPT_HOOK,
+        {"session_id": session_id, "prompt": "Second", "model": "gpt-5.4-codex"},
+        env,
+    )
+
+    assert "profile=gpt-5.6*" in json.loads(first.stdout)["hookSpecificOutput"]["additionalContext"]
+    assert "profile=gpt-5.4*" in json.loads(second.stdout)["hookSpecificOutput"]["additionalContext"]
+    state = json.loads(
+        (codex_home / "redteam-mode" / "state" / "sessions" / f"{session_id}.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    assert state["active_model"] == "gpt-5.4-codex"
+    assert state["active_prompt_profile"] == "gpt-5.4*"
+
+
+def test_launcher_profile_lock_matches_profile_family_and_locks_default_exactly() -> None:
+    assert model_prompt_profiles.is_pinned_model_compatible(
+        "gpt-5.6-codex", "gpt-5.6-sol", "gpt-5.6*"
+    )
+    assert not model_prompt_profiles.is_pinned_model_compatible(
+        "gpt-5.5-codex", "gpt-5.6-sol", "gpt-5.6*"
+    )
+    assert model_prompt_profiles.is_pinned_model_compatible("custom-a", "custom-a", "default")
+    assert not model_prompt_profiles.is_pinned_model_compatible("custom-b", "custom-a", "default")
+
+
+def test_launcher_profile_lock_blocks_incompatible_turn_without_mutating_state(tmp_path: Path) -> None:
+    session_id = "launcher-profile-lock"
+    codex_home = tmp_path / "codex-home"
+    env = {
+        **os.environ,
+        "CODEX_HOME": str(codex_home),
+        "CODEX_REDTEAM_PROFILE_MODE": "single",
+        "CODEX_REDTEAM_PINNED_MODEL": "gpt-5.6-sol",
+        "CODEX_REDTEAM_PINNED_PROFILE": "gpt-5.6*",
+        "CODEX_REDTEAM_PINNED_PROFILE_FILE": "Jailbreak.gpt-5.6.md",
+        "NO_COLOR": "1",
+    }
+
+    compatible = _run_hook_script(
+        PROMPT_HOOK,
+        {"session_id": session_id, "prompt": "Compatible", "model": "gpt-5.6-codex"},
+        env,
+    )
+    blocked = _run_hook_script(
+        PROMPT_HOOK,
+        {"session_id": session_id, "prompt": "Incompatible", "model": "gpt-5.5-codex"},
+        env,
+    )
+
+    compatible_context = json.loads(compatible.stdout)["hookSpecificOutput"]["additionalContext"]
+    assert "catalog=single-profile" in compatible_context
+    assert "profile=gpt-5.6*" in compatible_context
+    blocked_payload = json.loads(blocked.stdout)
+    assert blocked_payload["decision"] == "block"
+    assert "锁定模型族" in blocked_payload["reason"]
+    assert "locked model family" in blocked_payload["reason"]
+    assert "hookSpecificOutput" not in blocked_payload
+    state = json.loads(
+        (codex_home / "redteam-mode" / "state" / "sessions" / f"{session_id}.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    assert state["active_model"] == "gpt-5.6-codex"
+    assert state["active_prompt_profile"] == "gpt-5.6*"
 
 
 def test_prompt_hook_rejects_alias_only_payload(tmp_path: Path) -> None:
@@ -686,10 +977,12 @@ def test_session_start_preserves_mode_on_resume_and_compact(tmp_path: Path) -> N
     assert json.loads(state_path.read_text(encoding="utf-8"))["mode"] == "normal"
     after_clear = _run_hook_script(
         PROMPT_HOOK,
-        {"session_id": session_id, "prompt": "Review authentication bypass risk"},
+        {"session_id": session_id, "prompt": "Review authentication bypass risk", "model": "gpt-5.6-codex"},
         env,
     )
-    assert after_clear.stdout == ""
+    after_clear_context = json.loads(after_clear.stdout)["hookSpecificOutput"]["additionalContext"]
+    assert after_clear_context.count("[model-prompt-profile]") == 1
+    assert "scope=current-turn" in after_clear_context
 
 
 @pytest.mark.parametrize(
@@ -743,7 +1036,11 @@ def test_mode_disable_describes_remaining_base_and_history_context(tmp_path: Pat
     }
 
     _run_hook_script(PROMPT_HOOK, {"session_id": session_id, "prompt": "/redteam light"}, env)
-    disabled = _run_hook_script(PROMPT_HOOK, {"session_id": session_id, "prompt": "/redteam off"}, env)
+    disabled = _run_hook_script(
+        PROMPT_HOOK,
+        {"session_id": session_id, "prompt": "/redteam off", "model": "gpt-5.6-codex"},
+        env,
+    )
     context = json.loads(disabled.stdout)["hookSpecificOutput"]["additionalContext"]
 
     assert "Structured red-team routing disabled" in context
@@ -756,13 +1053,15 @@ def test_mode_disable_describes_remaining_base_and_history_context(tmp_path: Pat
     assert json.loads(state_path.read_text(encoding="utf-8"))["mode"] == "normal"
     after_disable = _run_hook_script(
         PROMPT_HOOK,
-        {"session_id": session_id, "prompt": "Review authentication bypass risk"},
+        {"session_id": session_id, "prompt": "Review authentication bypass risk", "model": "gpt-5.6-codex"},
         env,
     )
-    assert after_disable.stdout == ""
+    after_disable_context = json.loads(after_disable.stdout)["hookSpecificOutput"]["additionalContext"]
+    assert after_disable_context.count("[model-prompt-profile]") == 1
+    assert "scope=current-turn" in after_disable_context
 
 
-def test_embedded_enable_command_does_not_modify_normal_state(tmp_path: Path) -> None:
+def test_embedded_enable_command_keeps_normal_mode_with_a_selector(tmp_path: Path) -> None:
     session_id = "embedded-enable-session"
     codex_home = tmp_path / "codex-home"
     env = {**os.environ, "CODEX_HOME": str(codex_home), "NO_COLOR": "1"}
@@ -773,8 +1072,12 @@ def test_embedded_enable_command_does_not_modify_normal_state(tmp_path: Path) ->
         env,
     )
 
-    assert submitted.stdout == ""
-    assert not (codex_home / "redteam-mode" / "state" / "sessions" / f"{session_id}.json").exists()
+    context = json.loads(submitted.stdout)["hookSpecificOutput"]["additionalContext"]
+    state = json.loads(
+        (codex_home / "redteam-mode" / "state" / "sessions" / f"{session_id}.json").read_text(encoding="utf-8")
+    )
+    assert context.count("[model-prompt-profile]") == 1
+    assert state["mode"] == "normal"
 
 
 def test_embedded_disable_command_routes_without_disabling_active_mode(tmp_path: Path) -> None:
@@ -801,7 +1104,7 @@ def test_embedded_disable_command_routes_without_disabling_active_mode(tmp_path:
     assert json.loads(state_path.read_text(encoding="utf-8"))["mode"] == "redteam-light"
 
 
-def test_embedded_opsec_command_does_not_modify_state(tmp_path: Path) -> None:
+def test_embedded_opsec_command_keeps_normal_mode_with_a_selector(tmp_path: Path) -> None:
     session_id = "embedded-opsec-session"
     codex_home = tmp_path / "codex-home"
     env = {**os.environ, "CODEX_HOME": str(codex_home), "NO_COLOR": "1"}
@@ -812,8 +1115,12 @@ def test_embedded_opsec_command_does_not_modify_state(tmp_path: Path) -> None:
         env,
     )
 
-    assert submitted.stdout == ""
-    assert not (codex_home / "redteam-mode" / "state" / "sessions" / f"{session_id}.json").exists()
+    context = json.loads(submitted.stdout)["hookSpecificOutput"]["additionalContext"]
+    state = json.loads(
+        (codex_home / "redteam-mode" / "state" / "sessions" / f"{session_id}.json").read_text(encoding="utf-8")
+    )
+    assert context.count("[model-prompt-profile]") == 1
+    assert state["mode"] == "normal"
 
 
 def test_state_paths_use_codex_home_and_ignore_temp(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:

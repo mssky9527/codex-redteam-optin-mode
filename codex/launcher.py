@@ -10,7 +10,6 @@ import subprocess
 import sys
 import tempfile
 import tomllib
-from typing import Mapping
 
 
 DEFAULT_PROFILE_FILES = {
@@ -34,17 +33,51 @@ def _assignment_value(raw: str, key: str) -> str:
     return parsed.strip() if isinstance(parsed, str) else ""
 
 
-def _model_from_args(args: list[str]) -> str:
-    for index, argument in enumerate(args):
-        if argument in {"--model", "-m"} and index + 1 < len(args):
-            return args[index + 1].strip()
+def _record_config_assignment(raw: str, models: list[str]) -> None:
+    name, separator, _ = raw.partition("=")
+    if not separator:
+        return
+    normalized_name = name.strip()
+    if normalized_name == "model_instructions_file":
+        raise ValueError("model_instructions_file is managed by the launcher")
+    if normalized_name != "model":
+        return
+    value = _assignment_value(raw, "model")
+    if not value:
+        raise ValueError("model argument must not be empty")
+    models.append(value)
+
+
+def _model_arguments(args: list[str]) -> list[str]:
+    models: list[str] = []
+    index = 0
+    while index < len(args):
+        argument = args[index]
+        if argument == "--":
+            break
+        if argument in {"--model", "-m"}:
+            if index + 1 >= len(args) or not args[index + 1].strip() or args[index + 1].startswith("-"):
+                raise ValueError(f"{argument} requires a model value")
+            models.append(args[index + 1].strip())
+            index += 2
+            continue
         if argument.startswith("--model="):
-            return argument.split("=", 1)[1].strip()
-        if argument in {"-c", "--config"} and index + 1 < len(args):
-            value = _assignment_value(args[index + 1], "model")
-            if value:
-                return value
-    return ""
+            value = argument.split("=", 1)[1].strip()
+            if not value:
+                raise ValueError("--model requires a model value")
+            models.append(value)
+            index += 1
+            continue
+        if argument in {"-c", "--config"}:
+            if index + 1 >= len(args):
+                raise ValueError(f"{argument} requires a key=value argument")
+            _record_config_assignment(args[index + 1], models)
+            index += 2
+            continue
+        if argument.startswith("--config="):
+            _record_config_assignment(argument.split("=", 1)[1], models)
+        index += 1
+    return models
 
 
 def _read_config(config_path: Path) -> dict:
@@ -55,15 +88,14 @@ def _read_config(config_path: Path) -> dict:
     return value if isinstance(value, dict) else {}
 
 
-def resolve_model(args: list[str], environ: Mapping[str, str], config_path: Path) -> str:
-    argument_model = _model_from_args(args)
-    if argument_model:
-        return argument_model
-    environment_model = environ.get("CODEX_MODEL", "").strip()
-    if environment_model:
-        return environment_model
-    configured = _read_config(config_path).get("model")
-    return configured.strip() if isinstance(configured, str) and configured.strip() else "unknown"
+def resolve_model(args: list[str]) -> str:
+    models = _model_arguments(args)
+    if not models:
+        raise ValueError("launcher requires an explicit model argument")
+    distinct = {model.casefold() for model in models}
+    if len(distinct) != 1:
+        raise ValueError(f"conflicting model arguments: {', '.join(models)}")
+    return models[0]
 
 
 def profile_mapping(config_path: Path) -> dict[str, str]:
@@ -109,7 +141,12 @@ def main(argv: list[str] | None = None) -> int:
     args = list(sys.argv[1:] if argv is None else argv)
     codex_home = Path(__file__).resolve().parents[1]
     config_path = codex_home / "config.toml"
-    model = resolve_model(args, os.environ, config_path)
+    try:
+        model = resolve_model(args)
+    except ValueError as exc:
+        print(f"ERROR: {exc}", file=sys.stderr)
+        print(f"错误：{exc}", file=sys.stderr)
+        return 2
     mapping = profile_mapping(config_path)
     pattern, filename = select_profile(model, mapping)
     profile_path = codex_home / "prompts" / Path(filename).name
@@ -128,7 +165,8 @@ def main(argv: list[str] | None = None) -> int:
         pattern,
         profile_path.name,
     )
-    runtime_dir = codex_home / "redteam-mode"
+    runtime_dir = codex_home / "redteam-mode" / "state" / "system_instructions"
+    runtime_dir.mkdir(parents=True, exist_ok=True)
     descriptor, temporary = tempfile.mkstemp(
         prefix=f"system-instructions.{profile_path.name}.",
         suffix=".SESSION.md",
@@ -146,6 +184,21 @@ def main(argv: list[str] | None = None) -> int:
         return 127
     environment = dict(os.environ)
     environment["CODEX_MODEL"] = model
+    environment["CODEX_REDTEAM_PROFILE_MODE"] = "single"
+    environment["CODEX_REDTEAM_PINNED_MODEL"] = model
+    environment["CODEX_REDTEAM_PINNED_PROFILE"] = pattern
+    environment["CODEX_REDTEAM_PINNED_PROFILE_FILE"] = profile_path.name
+    print(
+        "提示：本启动器已加载单一 system profile。\n"
+        f"启动模型：{model}\n锁定模型族：{pattern}\nProfile 文件：{profile_path.name}\n"
+        "同一模型族的变体可以继续使用；切换到其他模型族不会更新 system instructions，"
+        "下一次用户提示将被阻止。\n\n"
+        "Notice: This launcher loaded a single system profile.\n"
+        f"Launch model: {model}\nLocked model family: {pattern}\nProfile file: {profile_path.name}\n"
+        "Variants in the same model family remain compatible. Switching to another model family "
+        "will not update the system instructions, and the next user prompt will be blocked.",
+        file=sys.stderr,
+    )
     try:
         return subprocess.run(build_codex_command(args, session_path, executable), env=environment).returncode
     finally:

@@ -203,15 +203,15 @@ disable red team mode
 2. `instruction.ctf.md`
 3. 模型路由规则和所有配置的 `Jailbreak.gpt-5.x.md`
 
-安装后的 `config.toml` 会让 `model_instructions_file` 指向 `./redteam-mode/system-instructions.md`。该系统文件包含基础指令、模型路由规则以及所有配置的 GPT-5.x Profile；每个新对话的 `SessionStart` Hook 始终只报告当前模型/Profile 元数据，系统层据此激活唯一匹配段落，其他 Profile 段落按系统规则保持惰性。
+安装后的 `config.toml` 会让 `model_instructions_file` 指向 `./redteam-mode/system-instructions.md`。该系统文件包含基础指令、模型路由规则以及所有配置的 GPT-5.x Profile。`SessionStart` 提供会话初始化 fallback selector；每个被允许提交的 `UserPromptSubmit` 根据最新 Hook `model` 字段提供一个本轮权威 selector。当前 selector 会使历史 selector 失效，只激活一个匹配的系统 Profile，其余 Profile 保持惰性。
 
 #### Codex App
 
-安装后直接打开 Codex App。新建对话并在 App 中选择 GPT-5.5 或 GPT-5.6 时，静态 `model_instructions_file` 加载同一个系统路由文件，`SessionStart` 的模型元数据选择对应 Profile。首次安装或 Hook 内容更新后需在 Codex 的 Hook 管理界面信任该 `SessionStart` Hook。模型切换请新建对话；同一对话内保留启动时的系统 Profile。
+安装后直接打开 Codex App。静态 `model_instructions_file` 加载统一系统路由文件；`SessionStart` 初始化 Profile，每个 `UserPromptSubmit` 再依据当前模型刷新 selector。会话内切换模型后，下一次用户提示会自动选择新 Profile，不需要专门 Hook `/model`。首次安装或 Hook 内容更新后，需要在 Codex 的 Hook 管理界面信任已安装的上下文 Hook。
 
 #### Codex CLI
 
-普通 `codex` 新会话同样使用系统路由文件。安装器还部署 `redteam-mode/codex-redteam.cmd` 和 `redteam-mode/codex-redteam`：它们在创建 Codex 进程前从本次 `--model` / `-m` / `-c model=...`、`CODEX_MODEL` 或 `config.toml` 检测模型，只生成并加载匹配的单 Profile 系统文件。每个 CLI 会话使用独立的 `system-instructions.Jailbreak.gpt-5.x.SESSION.md`，进程结束后自动清理。
+普通 `codex` 会话同样使用系统路由文件。安装器还会默认部署但不强制使用 `redteam-mode/codex-redteam.cmd` 和 `redteam-mode/codex-redteam`。包装启动器要求通过 `--model`、`-m` 或 `-c model=...` 显式指定模型，拒绝冲突的模型声明，并通过本次进程专用的 `model_instructions_file` 只加载一个匹配 Profile。临时文件仅位于 `redteam-mode/state/system_instructions/`，正常退出后自动删除。该进程锁定到所选 Profile 模型族：`gpt-5.6-sol` 与 `gpt-5.6-codex` 等同族变体可以继续使用；切换到其他模型族后的下一次提示会被阻止，并返回中英双语处理说明。
 
 默认映射可在 `config.toml` 中覆盖：
 
@@ -223,7 +223,7 @@ disable red team mode
 default = "Jailbreak.default.md"
 ```
 
-profile 文件位于 `$CODEX_HOME/prompts/`。匹配采用模型名通配符；未匹配或专用文件缺失时回落到 `default`。App/普通 CLI 由系统路由目录加 `SessionStart` 元数据选择；`codex-redteam` CLI 启动器则在进程启动前加载单 Profile。两种方式都以新对话为切换边界。
+Profile 文件位于 `$CODEX_HOME/prompts/`。匹配采用模型名通配符；未匹配或专用文件缺失时回落到 `default`。App 和普通 CLI 使用静态系统 catalog 加每轮 Hook selector，切换模型族后会在下一次提示时生效。可选的 `codex-redteam` 启动器会在进程启动前选择单 Profile，若要使用其他 Profile 模型族则必须重新启动。
 
 ## 自动化工具策略
 

@@ -24,10 +24,15 @@ class ModelPromptProfile:
     content: str
     source: str
 
-    def render(self) -> str:
+    def render(self, *, scope: str, catalog: str) -> str:
+        if scope == "current-turn":
+            authority = "authoritative=true; supersedes=all-prior"
+        else:
+            authority = "authoritative=false; superseded-by=current-turn"
         return (
             "[model-prompt-profile]\n"
             f"model={self.model}; profile={self.profile}; source={self.source}; file={self.filename}; "
+            f"catalog={catalog}; scope={scope}; {authority}; "
             "delivery=model_instructions_file; layer=system"
         )
 
@@ -101,12 +106,24 @@ def _profile_mapping(configs: list[dict[str, Any]]) -> dict[str, str]:
     return mapping
 
 
-def _select_profile(model: str, mapping: dict[str, str]) -> tuple[str, str]:
+def _matches_profile_pattern(model: str, pattern: str) -> bool:
     normalized = model.casefold()
+    lowered = pattern.casefold()
+    return fnmatchcase(normalized, lowered) or (
+        not any(char in lowered for char in "*?[") and normalized.startswith(lowered)
+    )
+
+
+def is_pinned_model_compatible(model: str, pinned_model: str, pinned_profile: str) -> bool:
+    if pinned_profile.casefold() == "default":
+        return bool(model.strip()) and model.casefold() == pinned_model.casefold()
+    return bool(pinned_profile.strip()) and _matches_profile_pattern(model, pinned_profile)
+
+
+def _select_profile(model: str, mapping: dict[str, str]) -> tuple[str, str]:
     patterns = sorted((key for key in mapping if key.casefold() != "default"), key=len, reverse=True)
     for pattern in patterns:
-        lowered = pattern.casefold()
-        if fnmatchcase(normalized, lowered) or (not any(char in lowered for char in "*?[") and normalized.startswith(lowered)):
+        if _matches_profile_pattern(model, pattern):
             return pattern, mapping[pattern]
     return "default", mapping.get("default", DEFAULT_PROFILE_FILES["default"])
 
